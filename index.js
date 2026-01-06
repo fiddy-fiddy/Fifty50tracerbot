@@ -301,8 +301,15 @@ console.error('❌ ERROR: DISCORD_BOT_TOKEN is not set!');
 process.exit(1);
 }
 client.login(token);
+const express = require('express');
+const app = express();
 
+// Simple endpoint so Railway keeps the bot alive
+app.get('/', (req, res) => res.send('Bot is running'));
 
+app.listen(process.env.PORT || 3000, () => {
+console.log('Server is alive');
+});
     
 
    
