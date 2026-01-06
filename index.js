@@ -300,7 +300,7 @@ if (!token) {
 console.error('❌ ERROR: DISCORD_BOT_TOKEN is not set!');
 process.exit(1);
 }
-client.login(token);
+client.login(DISCORD_TOKEN);
 const express = require('express');
 const app = express();
 
