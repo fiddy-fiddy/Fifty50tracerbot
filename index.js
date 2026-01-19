@@ -38,7 +38,7 @@ console.warn(`Shard ${shardID} disconnected. Event:`, event);
 });
 
 // --------------------
-// 5️⃣ Command Map (all commands here, keep your logic)
+// 5️⃣ Command Map (put your existing logic here)
 // --------------------
 const commands = {
 follow: async (interaction) => {
@@ -74,10 +74,11 @@ client.once('ready', async () => {
 try {
 console.log(`${client.user.tag} is online!`);
 
-const guild = client.guilds.cache.first();
-if (!guild) return console.log('Bot is not in a server yet.');
+// Register commands directly in your server
+const guild = client.guilds.cache.get("1450546600823886007");
+if (!guild) return console.log('Bot is not in your server yet.');
 
-// Full list of commands (keep the same)
+// Full list of commands (kept the same as before)
 const allCommands = [
 { name: 'follow', description: 'Follow a bettor', options: [{ name: 'target', type: 6, description: 'User to follow', required: true }] },
 { name: 'unfollow', description: 'Stop following a bettor', options: [{ name: 'target', type: 6, description: 'User to unfollow', required: true }] },
@@ -161,14 +162,6 @@ console.warn("Bot not ready, attempting reconnect...");
 client.login(process.env.TOKEN).catch(err => console.error("Reconnect failed:", err));
 }
 }, 1000 * 60 * 5); // every 5 minutes
-
-   
-
-    
-
-
-
-   
 
 
 
