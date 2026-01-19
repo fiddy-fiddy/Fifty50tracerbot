@@ -1,4 +1,11 @@
-// ====== IMPORTS ======
+// Crash protection - Step 1
+process.on("unhandledRejection", (reason, promise) => {
+console.error("Unhandled Rejection:", reason);
+});
+
+process.on("uncaughtException", (error) => {
+console.error("Uncaught Exception:", error);
+});// ====== IMPORTS ======
 const { Client, GatewayIntentBits, Partials, PermissionFlagsBits, EmbedBuilder } = require('discord.js');
 const fs = require('fs');
 const express = require('express');
