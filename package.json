@@ -1,17 +1,12 @@
 {
-"name": "fifty50tracerbot",
-"version": "1.0.0",
-"description": "Fifty50 Discord bot",
-"main": "index.js",
-"scripts": {
-"deploy": "node deploy-commands.js",
-"start": "node index.js"
-},
-"dependencies": {
-"discord.js": "^14.14.1",
-"dotenv": "^16.4.5"
-},
-"engines": {
-"node": "18.x"
-}
+  "name": "fifty50-bot",
+  "version": "1.0.0",
+  "description": "Fifty50 betting community bot",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.14.1"
+  }
 }
