@@ -1,17 +1,17 @@
 {
-"name": "fifty50-bot",
+"name": "fifty50tracerbot",
 "version": "1.0.0",
-"description": "Discord bot for Fifty50 project",
+"description": "Fifty50 Discord bot",
 "main": "index.js",
-"type": "commonjs",
 "scripts": {
+"deploy": "node deploy-commands.js",
 "start": "node index.js"
-},
-"engines": {
-"node": "18.x"
 },
 "dependencies": {
 "discord.js": "^14.14.1",
-"dotenv": "^16.3.1"
+"dotenv": "^16.4.5"
+},
+"engines": {
+"node": "18.x"
 }
 }
