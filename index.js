@@ -112,48 +112,51 @@ client.on('messageCreate', async (message) => {
     if (message.channel.name !== WINS_CHANNEL) return;
 
     const lines = message.content.split('\n');
+    let updated = false;
 
     for (const line of lines) {
-        const match = line.trim().match(/^(.+?)\s([+-]\d+)$/);
+        // Flexible regex for "Name +/-odds"
+        const match = line.trim().match(/^(?:@)?(.*?)\s*([+-]?\d+)$/);
         if (!match) continue;
 
-        const name = match[1];
+        const name = match[1].trim();
         const odds = parseInt(match[2]);
 
-        if (!leaderboard[name]) leaderboard[name] = 0;
-        leaderboard[name] += odds;
+        if (name && !isNaN(odds)) {
+            if (!leaderboard[name]) leaderboard[name] = 0;
+            leaderboard[name] += odds;
+            updated = true;
+        }
     }
 
-    saveLeaderboard();
+    if (updated) {
+        saveLeaderboard();
+        
+        const lbChannel = message.guild.channels.cache.find(c => c.name.includes('leaderboards'));
+        if (lbChannel) {
+            const sorted = Object.entries(leaderboard).sort((a, b) => b[1] - a[1]).slice(0, 10);
+            let output = '';
+            let rank = 1;
 
-    const lbChannel = message.guild.channels.cache.find(c => c.name.toLowerCase().includes('leaderboard'));
-    if (lbChannel) {
-        const sorted = Object.entries(leaderboard).sort((a, b) => b[1] - a[1]).slice(0, 10);
-        let output = '';
-        let rank = 1;
-
-        for (let i = 0; i < sorted.length; i++) {
-            const [name, value] = sorted[i];
-            if (i > 0 && value === sorted[i - 1][1]) {
-                // tie
-            } else {
-                rank = i + 1;
+            for (let i = 0; i < sorted.length; i++) {
+                const [name, value] = sorted[i];
+                if (i > 0 && value !== sorted[i - 1][1]) rank = i + 1;
+                const sign = value >= 0 ? '+' : '';
+                const medal = rank === 1 ? '🥇 ' : rank === 2 ? '🥈 ' : rank === 3 ? '🥉 ' : '🔹 ';
+                output += `${medal}**#${rank}** ${name} • \`${sign}${value}\`\n`;
             }
-            const sign = value >= 0 ? '+' : '';
-            const medal = rank === 1 ? '🥇 ' : rank === 2 ? '🥈 ' : rank === 3 ? '🥉 ' : '🔹 ';
-            output += `${medal}**#${rank}** ${name} • \`${sign}${value}\`\n`;
+
+            const embed = new EmbedBuilder()
+                .setTitle('🏆 Fifty50 Leaderboard 🏆')
+                .setDescription(output || 'No records yet!')
+                .setColor(0x00AE86)
+                .setTimestamp()
+                .setFooter({ text: 'Fifty50 Betting Community' });
+
+            const messages = await lbChannel.messages.fetch({ limit: 5 });
+            await lbChannel.bulkDelete(messages);
+            lbChannel.send({ embeds: [embed] });
         }
-
-        const embed = new EmbedBuilder()
-            .setTitle('🏆 Fifty50 Leaderboard 🏆')
-            .setDescription(output || 'No records yet!')
-            .setColor(0x00AE86)
-            .setTimestamp()
-            .setFooter({ text: 'Fifty50 Betting Community' });
-
-        const messages = await lbChannel.messages.fetch({ limit: 5 });
-        await lbChannel.bulkDelete(messages);
-        lbChannel.send({ embeds: [embed] });
     }
 });
 
@@ -232,7 +235,7 @@ client.on('interactionCreate', async interaction => {
 
         await interaction.reply(`Added ${odds > 0 ? '+' : ''}${odds} to ${name}'s record`);
 
-        const lbChannel = interaction.guild.channels.cache.find(ch => ch.name.toLowerCase().includes('leaderboard'));
+        const lbChannel = interaction.guild.channels.cache.find(ch => ch.name.includes('leaderboards'));
         if (lbChannel) {
             const sorted = Object.entries(leaderboard).sort((a, b) => b[1] - a[1]).slice(0, 10);
             let output = '';
@@ -240,11 +243,7 @@ client.on('interactionCreate', async interaction => {
 
             for (let i = 0; i < sorted.length; i++) {
                 const [username, value] = sorted[i];
-                if (i > 0 && value === sorted[i - 1][1]) {
-                    // tie
-                } else {
-                    rank = i + 1;
-                }
+                if (i > 0 && value !== sorted[i - 1][1]) rank = i + 1;
                 const sign = value >= 0 ? '+' : '';
                 const medal = rank === 1 ? '🥇 ' : rank === 2 ? '🥈 ' : rank === 3 ? '🥉 ' : '🔹 ';
                 output += `${medal}**#${rank}** ${username} • \`${sign}${value}\`\n`;
@@ -273,7 +272,7 @@ client.on('interactionCreate', async interaction => {
 
         await interaction.reply('Leaderboard reset.');
 
-        const lbChannel = interaction.guild.channels.cache.find(ch => ch.name.toLowerCase().includes('leaderboard'));
+        const lbChannel = interaction.guild.channels.cache.find(ch => ch.name.includes('leaderboards'));
         if (lbChannel) {
             const messages = await lbChannel.messages.fetch({ limit: 5 });
             await lbChannel.bulkDelete(messages);
