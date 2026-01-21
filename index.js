@@ -165,6 +165,7 @@ client.on('interactionCreate', async interaction => {
     if (!interaction.isChatInputCommand()) return;
     const { commandName, options, user } = interaction;
 
+    // FOLLOW
     if (commandName === 'follow') {
         const target = options.getUser('target');
         if (!followers[user.id]) followers[user.id] = [];
@@ -177,6 +178,7 @@ client.on('interactionCreate', async interaction => {
         }
     }
 
+    // UNFOLLOW
     if (commandName === 'unfollow') {
         const target = options.getUser('target');
         if (followers[user.id]) {
@@ -186,6 +188,7 @@ client.on('interactionCreate', async interaction => {
         await interaction.reply(`You unfollowed **${target.username}**`);
     }
 
+    // FOLLOWING LIST
     if (commandName === 'following') {
         const followed = followers[user.id] || [];
         if (followed.length === 0) return interaction.reply('You are not following anyone.');
@@ -193,6 +196,7 @@ client.on('interactionCreate', async interaction => {
         await interaction.reply(`You are following:\n- ${names}`);
     }
 
+    // FEED
     if (commandName === 'feed') {
         const followed = followers[user.id] || [];
         if (followed.length === 0) return interaction.reply('You are not following anyone.');
@@ -204,6 +208,7 @@ client.on('interactionCreate', async interaction => {
         await interaction.reply(recentSlips || 'No recent slips from followed users.');
     }
 
+    // ALERTS ON/OFF
     if (commandName === 'alerts') {
         const toggle = options.getString('state');
         alerts[user.id] = toggle.toLowerCase() === 'on';
@@ -211,20 +216,32 @@ client.on('interactionCreate', async interaction => {
         await interaction.reply(`DM alerts turned **${toggle.toUpperCase()}**`);
     }
 
+    // VERIFY WIN (admin only)
     if (commandName === 'verifywin') {
         if (!interaction.member.permissions.has(PermissionFlagsBits.ManageGuild)) {
-            return interaction.reply({ content: 'No permission.', ephemeral: true });
+            return interaction.reply({ content: 'You do not have permission to use this command.', ephemeral: true });
         }
         const target = options.getUser('target');
         if (!leaderboard[target.id]) leaderboard[target.id] = 0;
         leaderboard[target.id] += 1;
         saveLeaderboard();
+
+        const channel = interaction.guild.channels.cache.find(ch => ch.name === 'leaderboard');
+        if (channel) {
+            let leaderboardText = Object.entries(leaderboard)
+                .sort((a, b) => b[1] - a[1])
+                .map(([id, wins], index) => `${index + 1}. <@${id}> - ${wins} wins`)
+                .join('\n');
+            await channel.send(`FIFTY50 LEADERBOARD\n${leaderboardText}`);
+        }
+
         await interaction.reply(`Recorded win for ${target.username}`);
     }
 
+    // ADD WIN (slash command)
     if (commandName === 'addwin') {
         if (!interaction.member.permissions.has(PermissionFlagsBits.ManageGuild)) {
-            return interaction.reply({ content: 'No permission.', ephemeral: true });
+            return interaction.reply({ content: 'You do not have permission to use this command.', ephemeral: true });
         }
         const name = options.getString('name');
         const odds = options.getInteger('odds');
@@ -233,6 +250,7 @@ client.on('interactionCreate', async interaction => {
         leaderboard[name] += odds;
         saveLeaderboard();
 
+        // Send reply FIRST
         await interaction.reply(`Added ${odds > 0 ? '+' : ''}${odds} to ${name}'s record`);
 
         const lbChannel = interaction.guild.channels.cache.find(ch => ch.name.includes('leaderboards'));
@@ -243,7 +261,11 @@ client.on('interactionCreate', async interaction => {
 
             for (let i = 0; i < sorted.length; i++) {
                 const [username, value] = sorted[i];
-                if (i > 0 && value !== sorted[i - 1][1]) rank = i + 1;
+                if (i > 0 && value === sorted[i - 1][1]) {
+                    // tie
+                } else {
+                    rank = i + 1;
+                }
                 const sign = value >= 0 ? '+' : '';
                 const medal = rank === 1 ? '🥇 ' : rank === 2 ? '🥈 ' : rank === 3 ? '🥉 ' : '🔹 ';
                 output += `${medal}**#${rank}** ${username} • \`${sign}${value}\`\n`;
@@ -262,15 +284,16 @@ client.on('interactionCreate', async interaction => {
         }
     }
 
+    // RESET LEADERBOARD (admin only)
     if (commandName === 'resetleaderboard') {
         if (!interaction.member.permissions.has(PermissionFlagsBits.ManageGuild)) {
-            return interaction.reply({ content: 'No permission.', ephemeral: true });
+            return interaction.reply({ content: 'You do not have permission to use this command.', ephemeral: true });
         }
         
         leaderboard = {};
         saveLeaderboard();
 
-        await interaction.reply('Leaderboard reset.');
+        await interaction.reply('Leaderboard has been completely reset.');
 
         const lbChannel = interaction.guild.channels.cache.find(ch => ch.name.includes('leaderboards'));
         if (lbChannel) {
@@ -279,7 +302,7 @@ client.on('interactionCreate', async interaction => {
             
             const embed = new EmbedBuilder()
                 .setTitle('🏆 Fifty50 Leaderboard 🏆')
-                .setDescription('Leaderboard reset. No records yet!')
+                .setDescription('Leaderboard has been reset. No records yet!')
                 .setColor(0x00AE86)
                 .setTimestamp()
                 .setFooter({ text: 'Fifty50 Betting Community' });
@@ -290,4 +313,9 @@ client.on('interactionCreate', async interaction => {
 });
 
 // ====== LOGIN ======
-client.login(process.env.DISCORD_BOT_TOKEN);
+const token = process.env.DISCORD_BOT_TOKEN;
+if (!token) {
+    console.error('❌ ERROR: DISCORD_BOT_TOKEN is not set!');
+    process.exit(1);
+}
+client.login(token); 
