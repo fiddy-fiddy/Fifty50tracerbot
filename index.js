@@ -108,8 +108,7 @@ client.on('messageCreate', async message => {
 const WINS_CHANNEL = 'wins';
 
 client.on('messageCreate', async (message) => {
-    if (message.author.bot) return;
-    if (!message.guild) return;
+    if (message.author.bot || !message.guild) return;
     if (message.channel.name !== WINS_CHANNEL) return;
 
     const lines = message.content.split('\n');
@@ -127,35 +126,35 @@ client.on('messageCreate', async (message) => {
 
     saveLeaderboard();
 
-    const sorted = Object.entries(leaderboard).sort((a, b) => b[1] - a[1]).slice(0, 10);
-    let output = '';
-    let rank = 1;
-
-    for (let i = 0; i < sorted.length; i++) {
-        const [name, value] = sorted[i];
-        if (i > 0 && value === sorted[i - 1][1]) {
-            // tie
-        } else {
-            rank = i + 1;
-        }
-        const sign = value >= 0 ? '+' : '';
-        const medal = rank === 1 ? '🥇 ' : rank === 2 ? '🥈 ' : rank === 3 ? '🥉 ' : '🔹 ';
-        output += `${medal}**#${rank}** ${name} • \`${sign}${value}\`\n`;
-    }
-
     const lbChannel = message.guild.channels.cache.find(c => c.name.toLowerCase().includes('leaderboard'));
-    if (!lbChannel) return;
+    if (lbChannel) {
+        const sorted = Object.entries(leaderboard).sort((a, b) => b[1] - a[1]).slice(0, 10);
+        let output = '';
+        let rank = 1;
 
-    const embed = new EmbedBuilder()
-        .setTitle('🏆 Fifty50 Leaderboard 🏆')
-        .setDescription(output || 'No records yet!')
-        .setColor(0x00AE86)
-        .setTimestamp()
-        .setFooter({ text: 'Fifty50 Betting Community' });
+        for (let i = 0; i < sorted.length; i++) {
+            const [name, value] = sorted[i];
+            if (i > 0 && value === sorted[i - 1][1]) {
+                // tie
+            } else {
+                rank = i + 1;
+            }
+            const sign = value >= 0 ? '+' : '';
+            const medal = rank === 1 ? '🥇 ' : rank === 2 ? '🥈 ' : rank === 3 ? '🥉 ' : '🔹 ';
+            output += `${medal}**#${rank}** ${name} • \`${sign}${value}\`\n`;
+        }
 
-    const messages = await lbChannel.messages.fetch({ limit: 5 });
-    await lbChannel.bulkDelete(messages);
-    lbChannel.send({ embeds: [embed] });
+        const embed = new EmbedBuilder()
+            .setTitle('🏆 Fifty50 Leaderboard 🏆')
+            .setDescription(output || 'No records yet!')
+            .setColor(0x00AE86)
+            .setTimestamp()
+            .setFooter({ text: 'Fifty50 Betting Community' });
+
+        const messages = await lbChannel.messages.fetch({ limit: 5 });
+        await lbChannel.bulkDelete(messages);
+        lbChannel.send({ embeds: [embed] });
+    }
 });
 
 // ====== COMMAND HANDLER ======
@@ -226,19 +225,68 @@ client.on('interactionCreate', async interaction => {
         }
         const name = options.getString('name');
         const odds = options.getInteger('odds');
+
         if (!leaderboard[name]) leaderboard[name] = 0;
         leaderboard[name] += odds;
         saveLeaderboard();
-        await interaction.reply(`Added ${odds} to ${name}`);
+
+        await interaction.reply(`Added ${odds > 0 ? '+' : ''}${odds} to ${name}'s record`);
+
+        const lbChannel = interaction.guild.channels.cache.find(ch => ch.name.toLowerCase().includes('leaderboard'));
+        if (lbChannel) {
+            const sorted = Object.entries(leaderboard).sort((a, b) => b[1] - a[1]).slice(0, 10);
+            let output = '';
+            let rank = 1;
+
+            for (let i = 0; i < sorted.length; i++) {
+                const [username, value] = sorted[i];
+                if (i > 0 && value === sorted[i - 1][1]) {
+                    // tie
+                } else {
+                    rank = i + 1;
+                }
+                const sign = value >= 0 ? '+' : '';
+                const medal = rank === 1 ? '🥇 ' : rank === 2 ? '🥈 ' : rank === 3 ? '🥉 ' : '🔹 ';
+                output += `${medal}**#${rank}** ${username} • \`${sign}${value}\`\n`;
+            }
+
+            const embed = new EmbedBuilder()
+                .setTitle('🏆 Fifty50 Leaderboard 🏆')
+                .setDescription(output || 'No records yet!')
+                .setColor(0x00AE86)
+                .setTimestamp()
+                .setFooter({ text: 'Fifty50 Betting Community' });
+
+            const messages = await lbChannel.messages.fetch({ limit: 5 });
+            await lbChannel.bulkDelete(messages);
+            await lbChannel.send({ embeds: [embed] });
+        }
     }
 
     if (commandName === 'resetleaderboard') {
         if (!interaction.member.permissions.has(PermissionFlagsBits.ManageGuild)) {
             return interaction.reply({ content: 'No permission.', ephemeral: true });
         }
+        
         leaderboard = {};
         saveLeaderboard();
+
         await interaction.reply('Leaderboard reset.');
+
+        const lbChannel = interaction.guild.channels.cache.find(ch => ch.name.toLowerCase().includes('leaderboard'));
+        if (lbChannel) {
+            const messages = await lbChannel.messages.fetch({ limit: 5 });
+            await lbChannel.bulkDelete(messages);
+            
+            const embed = new EmbedBuilder()
+                .setTitle('🏆 Fifty50 Leaderboard 🏆')
+                .setDescription('Leaderboard reset. No records yet!')
+                .setColor(0x00AE86)
+                .setTimestamp()
+                .setFooter({ text: 'Fifty50 Betting Community' });
+                
+            await lbChannel.send({ embeds: [embed] });
+        }
     }
 });
 
