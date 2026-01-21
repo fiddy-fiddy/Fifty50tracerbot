@@ -33,7 +33,7 @@ function saveSlips() { fs.writeFileSync(SLIPS_FILE, JSON.stringify(slips, null, 
 function saveLeaderboard() { fs.writeFileSync(LEADERBOARD_FILE, JSON.stringify(leaderboard, null, 2)); }
 function saveAlerts() { fs.writeFileSync(ALERTS_FILE, JSON.stringify(alerts, null, 2)); }
 
-// ====== BOT READY & COMMAND REGISTRATION ======
+// ====== BOT READY ======
 client.once('ready', async () => {
     console.log(`${client.user.tag} is online!`);
     
@@ -43,21 +43,36 @@ client.once('ready', async () => {
         { name: 'following', description: 'See who you are following' },
         { name: 'feed', description: 'See recent slips from users you follow' },
         { name: 'alerts', description: 'Turn DM alerts on or off', options: [{ name: 'state', type: 3, description: 'on or off', required: true }] },
-        { name: 'addwin', description: 'Add a win to the leaderboard', options: [{ name: 'name', type: 3, description: 'Bettor name', required: true }, { name: 'odds', type: 4, description: 'Win amount (+/- value)', required: true }] },
-        { name: 'resetleaderboard', description: 'Admin: reset the entire leaderboard' },
-        { name: 'verifywin', description: 'Admin: log a win for a user', options: [{ name: 'target', type: 6, description: 'User to verify', required: true }] }
+        { 
+            name: 'addwin', 
+            description: 'Add a win to the leaderboard', 
+            default_member_permissions: PermissionFlagsBits.ManageGuild.toString(),
+            options: [{ name: 'name', type: 3, description: 'Bettor name', required: true }, { name: 'odds', type: 4, description: 'Win amount (+/- value)', required: true }] 
+        },
+        { 
+            name: 'resetleaderboard', 
+            description: 'Admin: reset the entire leaderboard',
+            default_member_permissions: PermissionFlagsBits.ManageGuild.toString()
+        },
+        { 
+            name: 'verifywin', 
+            description: 'Admin: log a win for a user', 
+            default_member_permissions: PermissionFlagsBits.ManageGuild.toString(),
+            options: [{ name: 'target', type: 6, description: 'User to verify', required: true }] 
+        }
     ];
 
     try {
-        console.log('Registering commands...');
-        // Registers commands globally (takes a few mins) AND to every server the bot is in (instant)
+        console.log('Started refreshing application (/) commands.');
         await client.application.commands.set(data);
+        console.log('Successfully reloaded application (/) commands globally!');
+        
         client.guilds.cache.forEach(async (guild) => {
             await guild.commands.set(data);
+            console.log(`Successfully reloaded commands for guild: ${guild.name}`);
         });
-        console.log('Slash commands registered!');
     } catch (error) {
-        console.error('Error registering commands:', error);
+        console.error('Error registering slash commands:', error);
     }
 });
 
@@ -93,27 +108,24 @@ client.on('messageCreate', async message => {
 const WINS_CHANNEL = 'wins';
 
 client.on('messageCreate', async (message) => {
-    if (message.author.bot || !message.guild) return;
+    if (message.author.bot) return;
+    if (!message.guild) return;
     if (message.channel.name !== WINS_CHANNEL) return;
 
     const lines = message.content.split('\n');
+
     for (const line of lines) {
         const match = line.trim().match(/^(.+?)\s([+-]\d+)$/);
         if (!match) continue;
 
         const name = match[1];
         const odds = parseInt(match[2]);
+
         if (!leaderboard[name]) leaderboard[name] = 0;
         leaderboard[name] += odds;
     }
 
     saveLeaderboard();
-    updateLeaderboardEmbed(message.guild);
-});
-
-async function updateLeaderboardEmbed(guild) {
-    const lbChannel = guild.channels.cache.find(c => c.name.toLowerCase().includes('leaderboard'));
-    if (!lbChannel) return;
 
     const sorted = Object.entries(leaderboard).sort((a, b) => b[1] - a[1]).slice(0, 10);
     let output = '';
@@ -121,11 +133,18 @@ async function updateLeaderboardEmbed(guild) {
 
     for (let i = 0; i < sorted.length; i++) {
         const [name, value] = sorted[i];
-        if (i > 0 && value !== sorted[i - 1][1]) rank = i + 1;
+        if (i > 0 && value === sorted[i - 1][1]) {
+            // tie
+        } else {
+            rank = i + 1;
+        }
         const sign = value >= 0 ? '+' : '';
         const medal = rank === 1 ? '🥇 ' : rank === 2 ? '🥈 ' : rank === 3 ? '🥉 ' : '🔹 ';
         output += `${medal}**#${rank}** ${name} • \`${sign}${value}\`\n`;
     }
+
+    const lbChannel = message.guild.channels.cache.find(c => c.name.toLowerCase().includes('leaderboard'));
+    if (!lbChannel) return;
 
     const embed = new EmbedBuilder()
         .setTitle('🏆 Fifty50 Leaderboard 🏆')
@@ -137,9 +156,9 @@ async function updateLeaderboardEmbed(guild) {
     const messages = await lbChannel.messages.fetch({ limit: 5 });
     await lbChannel.bulkDelete(messages);
     lbChannel.send({ embeds: [embed] });
-}
+});
 
-// ====== INTERACTION HANDLER ======
+// ====== COMMAND HANDLER ======
 client.on('interactionCreate', async interaction => {
     if (!interaction.isChatInputCommand()) return;
     const { commandName, options, user } = interaction;
@@ -190,6 +209,17 @@ client.on('interactionCreate', async interaction => {
         await interaction.reply(`DM alerts turned **${toggle.toUpperCase()}**`);
     }
 
+    if (commandName === 'verifywin') {
+        if (!interaction.member.permissions.has(PermissionFlagsBits.ManageGuild)) {
+            return interaction.reply({ content: 'No permission.', ephemeral: true });
+        }
+        const target = options.getUser('target');
+        if (!leaderboard[target.id]) leaderboard[target.id] = 0;
+        leaderboard[target.id] += 1;
+        saveLeaderboard();
+        await interaction.reply(`Recorded win for ${target.username}`);
+    }
+
     if (commandName === 'addwin') {
         if (!interaction.member.permissions.has(PermissionFlagsBits.ManageGuild)) {
             return interaction.reply({ content: 'No permission.', ephemeral: true });
@@ -199,8 +229,7 @@ client.on('interactionCreate', async interaction => {
         if (!leaderboard[name]) leaderboard[name] = 0;
         leaderboard[name] += odds;
         saveLeaderboard();
-        updateLeaderboardEmbed(interaction.guild);
-        await interaction.reply(`Added win for ${name}`);
+        await interaction.reply(`Added ${odds} to ${name}`);
     }
 
     if (commandName === 'resetleaderboard') {
@@ -209,7 +238,6 @@ client.on('interactionCreate', async interaction => {
         }
         leaderboard = {};
         saveLeaderboard();
-        updateLeaderboardEmbed(interaction.guild);
         await interaction.reply('Leaderboard reset.');
     }
 });
