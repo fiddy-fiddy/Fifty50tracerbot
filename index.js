@@ -1,17 +1,13 @@
 const { Client, GatewayIntentBits, Partials, PermissionFlagsBits, EmbedBuilder } = require('discord.js');
 const fs = require('fs');
 
-// ====== NEW: Stripe & Express ======
-const express = require('express');
-const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
-
 const client = new Client({
-intents: [
-GatewayIntentBits.Guilds,
-GatewayIntentBits.GuildMessages,
-GatewayIntentBits.MessageContent
-],
-partials: [Partials.Channel]
+    intents: [
+        GatewayIntentBits.Guilds,
+        GatewayIntentBits.GuildMessages,
+        GatewayIntentBits.MessageContent
+    ],
+    partials: [Partials.Channel]
 });
 
 // ====== DATA STORAGE ======
@@ -39,228 +35,185 @@ function saveAlerts() { fs.writeFileSync(ALERTS_FILE, JSON.stringify(alerts, nul
 
 // ====== BOT READY & COMMAND REGISTRATION ======
 client.once('ready', async () => {
-console.log(`${client.user.tag} is online!`);
+    console.log(`${client.user.tag} is online!`);
+   
+    const data = [
+        { name: 'follow', description: 'Follow a bettor', options: [{ name: 'target', type: 6, description: 'User to follow', required: true }] },
+        { name: 'unfollow', description: 'Stop following a bettor', options: [{ name: 'target', type: 6, description: 'User to unfollow', required: true }] },
+        { name: 'following', description: 'See who you are following' },
+        { name: 'feed', description: 'See recent slips from users you follow' },
+        { name: 'alerts', description: 'Turn DM alerts on or off', options: [{ name: 'state', type: 3, description: 'on or off', required: true }] },
+        { name: 'addwin', description: 'Add a win to the leaderboard', options: [{ name: 'name', type: 3, description: 'Bettor name', required: true }, { name: 'odds', type: 4, description: 'Win amount (+/- value)', required: true }] },
+        { name: 'resetleaderboard', description: 'Admin: reset the entire leaderboard' },
+        { name: 'verifywin', description: 'Admin: log a win for a user', options: [{ name: 'target', type: 6, description: 'User to verify', required: true }] }
+    ];
 
-const data = [
-{ name: 'follow', description: 'Follow a bettor', options: [{ name: 'target', type: 6, description: 'User to follow', required: true }] },
-{ name: 'unfollow', description: 'Stop following a bettor', options: [{ name: 'target', type: 6, description: 'User to unfollow', required: true }] },
-{ name: 'following', description: 'See who you are following' },
-{ name: 'feed', description: 'See recent slips from users you follow' },
-{ name: 'alerts', description: 'Turn DM alerts on or off', options: [{ name: 'state', type: 3, description: 'on or off', required: true }] },
-{ name: 'addwin', description: 'Add a win to the leaderboard', options: [{ name: 'name', type: 3, description: 'Bettor name', required: true }, { name: 'odds', type: 4, description: 'Win amount (+/- value)', required: true }] },
-{ name: 'resetleaderboard', description: 'Admin: reset the entire leaderboard' },
-{ name: 'verifywin', description: 'Admin: log a win for a user', options: [{ name: 'target', type: 6, description: 'User to verify', required: true }] }
-];
-
-try {
-console.log('Registering commands...');
-await client.application.commands.set(data);
-client.guilds.cache.forEach(async (guild) => {
-await guild.commands.set(data);
-});
-console.log('Slash commands registered!');
-} catch (error) {
-console.error('Error registering commands:', error);
-}
+    try {
+        console.log('Registering commands...');
+        // Registers commands globally (takes a few mins) AND to every server the bot is in (instant)
+        await client.application.commands.set(data);
+        client.guilds.cache.forEach(async (guild) => {
+            await guild.commands.set(data);
+        });
+        console.log('Slash commands registered!');
+    } catch (error) {
+        console.error('Error registering commands:', error);
+    }
 });
 
 // ====== LOG ALL SLIPS AND SEND ALERTS ======
 client.on('messageCreate', async message => {
-if (message.channel.name !== 'bet-slips') return;
-if (message.author.bot) return;
+    if (message.channel.name !== 'bet-slips') return;
+    if (message.author.bot) return;
 
-let attachmentUrl = message.attachments.first() ? message.attachments.first().url : null;
-let slip = {
-userId: message.author.id,
-username: message.author.username,
-content: message.content,
-timestamp: message.createdTimestamp,
-attachmentUrl
-};
-slips.push(slip);
-saveSlips();
+    let attachmentUrl = message.attachments.first() ? message.attachments.first().url : null;
+    let slip = {
+        userId: message.author.id,
+        username: message.author.username,
+        content: message.content,
+        timestamp: message.createdTimestamp,
+        attachmentUrl
+    };
+    slips.push(slip);
+    saveSlips();
 
-for (const [followerId, targets] of Object.entries(followers)) {
-if (targets.includes(message.author.id) && alerts[followerId]) {
-try {
-const user = await client.users.fetch(followerId);
-await user.send(`New slip from ${message.author.username}:\n${message.content}\n${attachmentUrl || ''}`);
-} catch (err) {
-console.log(`Failed to DM ${followerId}: ${err}`);
-}
-}
-}
+    for (const [followerId, targets] of Object.entries(followers)) {
+        if (targets.includes(message.author.id) && alerts[followerId]) {
+            try {
+                const user = await client.users.fetch(followerId);
+                await user.send(`New slip from ${message.author.username}:\n${message.content}\n${attachmentUrl || ''}`);
+            } catch (err) {
+                console.log(`Failed to DM ${followerId}: ${err}`);
+            }
+        }
+    }
 });
 
 // ====== AUTO LEADERBOARD TRACKING ======
 const WINS_CHANNEL = 'wins';
 
 client.on('messageCreate', async (message) => {
-if (message.author.bot || !message.guild) return;
-if (message.channel.name !== WINS_CHANNEL) return;
+    if (message.author.bot || !message.guild) return;
+    if (message.channel.name !== WINS_CHANNEL) return;
 
-const lines = message.content.split('\n');
-for (const line of lines) {
-const match = line.trim().match(/^(.+?)\s([+-]\d+)$/);
-if (!match) continue;
+    const lines = message.content.split('\n');
+    for (const line of lines) {
+        const match = line.trim().match(/^(.+?)\s([+-]\d+)$/);
+        if (!match) continue;
 
-const name = match[1];
-const odds = parseInt(match[2]);
-if (!leaderboard[name]) leaderboard[name] = 0;
-leaderboard[name] += odds;
-}
+        const name = match[1];
+        const odds = parseInt(match[2]);
+        if (!leaderboard[name]) leaderboard[name] = 0;
+        leaderboard[name] += odds;
+    }
 
-saveLeaderboard();
-updateLeaderboardEmbed(message.guild);
+    saveLeaderboard();
+    updateLeaderboardEmbed(message.guild);
 });
 
 async function updateLeaderboardEmbed(guild) {
-const lbChannel = guild.channels.cache.find(c => c.name.toLowerCase().includes('leaderboard'));
-if (!lbChannel) return;
+    const lbChannel = guild.channels.cache.find(c => c.name.toLowerCase().includes('leaderboard'));
+    if (!lbChannel) return;
 
-const sorted = Object.entries(leaderboard).sort((a, b) => b[1] - a[1]).slice(0, 10);
-let output = '';
-let rank = 1;
+    const sorted = Object.entries(leaderboard).sort((a, b) => b[1] - a[1]).slice(0, 10);
+    let output = '';
+    let rank = 1;
 
-for (let i = 0; i < sorted.length; i++) {
-const [name, value] = sorted[i];
-if (i > 0 && value !== sorted[i - 1][1]) rank = i + 1;
-const sign = value >= 0 ? '+' : '';
-const medal = rank === 1 ? '🥇 ' : rank === 2 ? '🥈 ' : rank === 3 ? '🥉 ' : '🔹 ';
-output += `${medal}**#${rank}** ${name} • \`${sign}${value}\`\n`;
-}
+    for (let i = 0; i < sorted.length; i++) {
+        const [name, value] = sorted[i];
+        if (i > 0 && value !== sorted[i - 1][1]) rank = i + 1;
+        const sign = value >= 0 ? '+' : '';
+        const medal = rank === 1 ? '🥇 ' : rank === 2 ? '🥈 ' : rank === 3 ? '🥉 ' : '🔹 ';
+        output += `${medal}**#${rank}** ${name} • \`${sign}${value}\`\n`;
+    }
 
-const embed = new EmbedBuilder()
-.setTitle('🏆 Fifty50 Leaderboard 🏆')
-.setDescription(output || 'No records yet!')
-.setColor(0x00AE86)
-.setTimestamp()
-.setFooter({ text: 'Fifty50 Betting Community' });
+    const embed = new EmbedBuilder()
+        .setTitle('🏆 Fifty50 Leaderboard 🏆')
+        .setDescription(output || 'No records yet!')
+        .setColor(0x00AE86)
+        .setTimestamp()
+        .setFooter({ text: 'Fifty50 Betting Community' });
 
-const messages = await lbChannel.messages.fetch({ limit: 5 });
-await lbChannel.bulkDelete(messages);
-lbChannel.send({ embeds: [embed] });
+    const messages = await lbChannel.messages.fetch({ limit: 5 });
+    await lbChannel.bulkDelete(messages);
+    lbChannel.send({ embeds: [embed] });
 }
 
 // ====== INTERACTION HANDLER ======
 client.on('interactionCreate', async interaction => {
-if (!interaction.isChatInputCommand()) return;
-const { commandName, options, user } = interaction;
+    if (!interaction.isChatInputCommand()) return;
+    const { commandName, options, user } = interaction;
 
-if (commandName === 'follow') {
-const target = options.getUser('target');
-if (!followers[user.id]) followers[user.id] = [];
-if (!followers[user.id].includes(target.id)) {
-followers[user.id].push(target.id);
-saveFollowers();
-await interaction.reply(`You are now following **${target.username}**`);
-} else {
-await interaction.reply(`You are already following **${target.username}**`);
-}
-}
+    if (commandName === 'follow') {
+        const target = options.getUser('target');
+        if (!followers[user.id]) followers[user.id] = [];
+        if (!followers[user.id].includes(target.id)) {
+            followers[user.id].push(target.id);
+            saveFollowers();
+            await interaction.reply(`You are now following **${target.username}**`);
+        } else {
+            await interaction.reply(`You are already following **${target.username}**`);
+        }
+    }
 
-if (commandName === 'unfollow') {
-const target = options.getUser('target');
-if (followers[user.id]) {
-followers[user.id] = followers[user.id].filter(id => id !== target.id);
-saveFollowers();
-}
-await interaction.reply(`You unfollowed **${target.username}**`);
-}
+    if (commandName === 'unfollow') {
+        const target = options.getUser('target');
+        if (followers[user.id]) {
+            followers[user.id] = followers[user.id].filter(id => id !== target.id);
+            saveFollowers();
+        }
+        await interaction.reply(`You unfollowed **${target.username}**`);
+    }
 
-if (commandName === 'following') {
-const followed = followers[user.id] || [];
-if (followed.length === 0) return interaction.reply('You are not following anyone.');
-let names = followed.map(id => client.users.cache.get(id)?.username || 'Unknown').join('\n- ');
-await interaction.reply(`You are following:\n- ${names}`);
-}
+    if (commandName === 'following') {
+        const followed = followers[user.id] || [];
+        if (followed.length === 0) return interaction.reply('You are not following anyone.');
+        let names = followed.map(id => client.users.cache.get(id)?.username || 'Unknown').join('\n- ');
+        await interaction.reply(`You are following:\n- ${names}`);
+    }
 
-if (commandName === 'feed') {
-const followed = followers[user.id] || [];
-if (followed.length === 0) return interaction.reply('No recent slips from followed users.');
-let recentSlips = slips
-.filter(slip => followed.includes(slip.userId))
-.slice(-5)
-.map(slip => `${slip.username}: ${slip.content} ${slip.attachmentUrl || ''}`)
-.join('\n\n');
-await interaction.reply(recentSlips || 'No recent slips from followed users.');
-}
+    if (commandName === 'feed') {
+        const followed = followers[user.id] || [];
+        if (followed.length === 0) return interaction.reply('You are not following anyone.');
+        let recentSlips = slips
+            .filter(slip => followed.includes(slip.userId))
+            .slice(-5)
+            .map(slip => `${slip.username}: ${slip.content} ${slip.attachmentUrl || ''}`)
+            .join('\n\n');
+        await interaction.reply(recentSlips || 'No recent slips from followed users.');
+    }
 
-if (commandName === 'alerts') {
-const toggle = options.getString('state');
-alerts[user.id] = toggle.toLowerCase() === 'on';
-saveAlerts();
-await interaction.reply(`DM alerts turned **${toggle.toUpperCase()}**`);
-}
+    if (commandName === 'alerts') {
+        const toggle = options.getString('state');
+        alerts[user.id] = toggle.toLowerCase() === 'on';
+        saveAlerts();
+        await interaction.reply(`DM alerts turned **${toggle.toUpperCase()}**`);
+    }
 
-if (commandName === 'addwin') {
-if (!interaction.member.permissions.has(PermissionFlagsBits.ManageGuild)) {
-return interaction.reply({ content: 'No permission.', ephemeral: true });
-}
-const name = options.getString('name');
-const odds = options.getInteger('odds');
-if (!leaderboard[name]) leaderboard[name] = 0;
-leaderboard[name] += odds;
-saveLeaderboard();
-updateLeaderboardEmbed(interaction.guild);
-await interaction.reply(`Added win for ${name}`);
-}
+    if (commandName === 'addwin') {
+        if (!interaction.member.permissions.has(PermissionFlagsBits.ManageGuild)) {
+            return interaction.reply({ content: 'No permission.', ephemeral: true });
+        }
+        const name = options.getString('name');
+        const odds = options.getInteger('odds');
+        if (!leaderboard[name]) leaderboard[name] = 0;
+        leaderboard[name] += odds;
+        saveLeaderboard();
+        updateLeaderboardEmbed(interaction.guild);
+        await interaction.reply(`Added win for ${name}`);
+    }
 
-if (commandName === 'resetleaderboard') {
-if (!interaction.member.permissions.has(PermissionFlagsBits.ManageGuild)) {
-return interaction.reply({ content: 'No permission.', ephemeral: true });
-}
-leaderboard = {};
-saveLeaderboard();
-updateLeaderboardEmbed(interaction.guild);
-await interaction.reply('Leaderboard reset.');
-}
+    if (commandName === 'resetleaderboard') {
+        if (!interaction.member.permissions.has(PermissionFlagsBits.ManageGuild)) {
+            return interaction.reply({ content: 'No permission.', ephemeral: true });
+        }
+        leaderboard = {};
+        saveLeaderboard();
+        updateLeaderboardEmbed(interaction.guild);
+        await interaction.reply('Leaderboard reset.');
+    }
 });
 
 // ====== LOGIN ======
 client.login(process.env.DISCORD_BOT_TOKEN);
 
-// ====== STRIPE WEBHOOK SERVER ======
-const app = express();
-app.use('/webhook', express.raw({ type: 'application/json' }));
-
-app.post('/webhook', async (req, res) => {
-const sig = req.headers['stripe-signature'];
-let event;
-
-try {
-event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
-} catch (err) {
-console.log('Webhook signature verification failed:', err.message);
-return res.status(400).send(`Webhook Error: ${err.message}`);
-}
-
-// ====== ASSIGN PAID ROLE ======
-if (event.type === 'checkout.session.completed') {
-const session = event.data.object;
-const discordId = session.metadata.discord_user_id;
-const guild = client.guilds.cache.first();
-const member = guild?.members.cache.get(discordId);
-if (member) {
-const role = guild.roles.cache.find(r => r.name === 'PAID');
-if (role) member.roles.add(role).catch(console.log);
-}
-}
-
-// ====== REMOVE PAID ROLE ======
-if (event.type === 'invoice.payment_failed' || event.type === 'customer.subscription.deleted') {
-const subscription = event.data.object;
-const discordId = subscription.metadata?.discord_user_id;
-const guild = client.guilds.cache.first();
-const member = guild?.members.cache.get(discordId);
-if (member) {
-const role = guild.roles.cache.find(r => r.name === 'PAID');
-if (role) member.roles.remove(role).catch(console.log);
-}
-}
-
-res.json({ received: true });
-});
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Stripe webhook server running on port ${PORT}`));
