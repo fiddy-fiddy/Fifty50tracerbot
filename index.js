@@ -1,13 +1,17 @@
 const { Client, GatewayIntentBits, Partials, PermissionFlagsBits, EmbedBuilder } = require('discord.js');
 const fs = require('fs');
 
+// ====== NEW: Stripe & Express ======
+const express = require('express');
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+
 const client = new Client({
-    intents: [
-        GatewayIntentBits.Guilds,
-        GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.MessageContent
-    ],
-    partials: [Partials.Channel]
+intents: [
+GatewayIntentBits.Guilds,
+GatewayIntentBits.GuildMessages,
+GatewayIntentBits.MessageContent
+],
+partials: [Partials.Channel]
 });
 
 // ====== DATA STORAGE ======
@@ -33,289 +37,230 @@ function saveSlips() { fs.writeFileSync(SLIPS_FILE, JSON.stringify(slips, null, 
 function saveLeaderboard() { fs.writeFileSync(LEADERBOARD_FILE, JSON.stringify(leaderboard, null, 2)); }
 function saveAlerts() { fs.writeFileSync(ALERTS_FILE, JSON.stringify(alerts, null, 2)); }
 
-// ====== BOT READY ======
+// ====== BOT READY & COMMAND REGISTRATION ======
 client.once('ready', async () => {
-    console.log(`${client.user.tag} is online!`);
-    
-    const data = [
-        { name: 'follow', description: 'Follow a bettor', options: [{ name: 'target', type: 6, description: 'User to follow', required: true }] },
-        { name: 'unfollow', description: 'Stop following a bettor', options: [{ name: 'target', type: 6, description: 'User to unfollow', required: true }] },
-        { name: 'following', description: 'See who you are following' },
-        { name: 'feed', description: 'See recent slips from users you follow' },
-        { name: 'alerts', description: 'Turn DM alerts on or off', options: [{ name: 'state', type: 3, description: 'on or off', required: true }] },
-        { 
-            name: 'addwin', 
-            description: 'Add a win to the leaderboard', 
-            default_member_permissions: PermissionFlagsBits.ManageGuild.toString(),
-            options: [{ name: 'name', type: 3, description: 'Bettor name', required: true }, { name: 'odds', type: 4, description: 'Win amount (+/- value)', required: true }] 
-        },
-        { 
-            name: 'resetleaderboard', 
-            description: 'Admin: reset the entire leaderboard',
-            default_member_permissions: PermissionFlagsBits.ManageGuild.toString()
-        },
-        { 
-            name: 'verifywin', 
-            description: 'Admin: log a win for a user', 
-            default_member_permissions: PermissionFlagsBits.ManageGuild.toString(),
-            options: [{ name: 'target', type: 6, description: 'User to verify', required: true }] 
-        }
-    ];
+console.log(`${client.user.tag} is online!`);
 
-    try {
-        console.log('Started refreshing application (/) commands.');
-        await client.application.commands.set(data);
-        console.log('Successfully reloaded application (/) commands globally!');
-        
-        client.guilds.cache.forEach(async (guild) => {
-            await guild.commands.set(data);
-            console.log(`Successfully reloaded commands for guild: ${guild.name}`);
-        });
-    } catch (error) {
-        console.error('Error registering slash commands:', error);
-    }
+const data = [
+{ name: 'follow', description: 'Follow a bettor', options: [{ name: 'target', type: 6, description: 'User to follow', required: true }] },
+{ name: 'unfollow', description: 'Stop following a bettor', options: [{ name: 'target', type: 6, description: 'User to unfollow', required: true }] },
+{ name: 'following', description: 'See who you are following' },
+{ name: 'feed', description: 'See recent slips from users you follow' },
+{ name: 'alerts', description: 'Turn DM alerts on or off', options: [{ name: 'state', type: 3, description: 'on or off', required: true }] },
+{ name: 'addwin', description: 'Add a win to the leaderboard', options: [{ name: 'name', type: 3, description: 'Bettor name', required: true }, { name: 'odds', type: 4, description: 'Win amount (+/- value)', required: true }] },
+{ name: 'resetleaderboard', description: 'Admin: reset the entire leaderboard' },
+{ name: 'verifywin', description: 'Admin: log a win for a user', options: [{ name: 'target', type: 6, description: 'User to verify', required: true }] }
+];
+
+try {
+console.log('Registering commands...');
+await client.application.commands.set(data);
+client.guilds.cache.forEach(async (guild) => {
+await guild.commands.set(data);
+});
+console.log('Slash commands registered!');
+} catch (error) {
+console.error('Error registering commands:', error);
+}
 });
 
 // ====== LOG ALL SLIPS AND SEND ALERTS ======
 client.on('messageCreate', async message => {
-    if (message.channel.name !== 'bet-slips') return;
-    if (message.author.bot) return;
+if (message.channel.name !== 'bet-slips') return;
+if (message.author.bot) return;
 
-    let attachmentUrl = message.attachments.first() ? message.attachments.first().url : null;
-    let slip = {
-        userId: message.author.id,
-        username: message.author.username,
-        content: message.content,
-        timestamp: message.createdTimestamp,
-        attachmentUrl
-    };
-    slips.push(slip);
-    saveSlips();
+let attachmentUrl = message.attachments.first() ? message.attachments.first().url : null;
+let slip = {
+userId: message.author.id,
+username: message.author.username,
+content: message.content,
+timestamp: message.createdTimestamp,
+attachmentUrl
+};
+slips.push(slip);
+saveSlips();
 
-    for (const [followerId, targets] of Object.entries(followers)) {
-        if (targets.includes(message.author.id) && alerts[followerId]) {
-            try {
-                const user = await client.users.fetch(followerId);
-                await user.send(`New slip from ${message.author.username}:\n${message.content}\n${attachmentUrl || ''}`);
-            } catch (err) {
-                console.log(`Failed to DM ${followerId}: ${err}`);
-            }
-        }
-    }
+for (const [followerId, targets] of Object.entries(followers)) {
+if (targets.includes(message.author.id) && alerts[followerId]) {
+try {
+const user = await client.users.fetch(followerId);
+await user.send(`New slip from ${message.author.username}:\n${message.content}\n${attachmentUrl || ''}`);
+} catch (err) {
+console.log(`Failed to DM ${followerId}: ${err}`);
+}
+}
+}
 });
 
 // ====== AUTO LEADERBOARD TRACKING ======
 const WINS_CHANNEL = 'wins';
 
 client.on('messageCreate', async (message) => {
-    if (message.author.bot || !message.guild) return;
-    if (message.channel.name !== WINS_CHANNEL) return;
+if (message.author.bot || !message.guild) return;
+if (message.channel.name !== WINS_CHANNEL) return;
 
-    const lines = message.content.split('\n');
-    let updated = false;
+const lines = message.content.split('\n');
+for (const line of lines) {
+const match = line.trim().match(/^(.+?)\s([+-]\d+)$/);
+if (!match) continue;
 
-    for (const line of lines) {
-        // Flexible regex for "Name +/-odds"
-        const match = line.trim().match(/^(?:@)?(.*?)\s*([+-]?\d+)$/);
-        if (!match) continue;
+const name = match[1];
+const odds = parseInt(match[2]);
+if (!leaderboard[name]) leaderboard[name] = 0;
+leaderboard[name] += odds;
+}
 
-        const name = match[1].trim();
-        const odds = parseInt(match[2]);
-
-        if (name && !isNaN(odds)) {
-            if (!leaderboard[name]) leaderboard[name] = 0;
-            leaderboard[name] += odds;
-            updated = true;
-        }
-    }
-
-    if (updated) {
-        saveLeaderboard();
-        
-        const lbChannel = message.guild.channels.cache.find(c => c.name.includes('leaderboards'));
-        if (lbChannel) {
-            const sorted = Object.entries(leaderboard).sort((a, b) => b[1] - a[1]).slice(0, 10);
-            let output = '';
-            let rank = 1;
-
-            for (let i = 0; i < sorted.length; i++) {
-                const [name, value] = sorted[i];
-                if (i > 0 && value !== sorted[i - 1][1]) rank = i + 1;
-                const sign = value >= 0 ? '+' : '';
-                const medal = rank === 1 ? '🥇 ' : rank === 2 ? '🥈 ' : rank === 3 ? '🥉 ' : '🔹 ';
-                output += `${medal}**#${rank}** ${name} • \`${sign}${value}\`\n`;
-            }
-
-            const embed = new EmbedBuilder()
-                .setTitle('🏆 Fifty50 Leaderboard 🏆')
-                .setDescription(output || 'No records yet!')
-                .setColor(0x00AE86)
-                .setTimestamp()
-                .setFooter({ text: 'Fifty50 Betting Community' });
-
-            const messages = await lbChannel.messages.fetch({ limit: 5 });
-            await lbChannel.bulkDelete(messages);
-            lbChannel.send({ embeds: [embed] });
-        }
-    }
+saveLeaderboard();
+updateLeaderboardEmbed(message.guild);
 });
 
-// ====== COMMAND HANDLER ======
+async function updateLeaderboardEmbed(guild) {
+const lbChannel = guild.channels.cache.find(c => c.name.toLowerCase().includes('leaderboard'));
+if (!lbChannel) return;
+
+const sorted = Object.entries(leaderboard).sort((a, b) => b[1] - a[1]).slice(0, 10);
+let output = '';
+let rank = 1;
+
+for (let i = 0; i < sorted.length; i++) {
+const [name, value] = sorted[i];
+if (i > 0 && value !== sorted[i - 1][1]) rank = i + 1;
+const sign = value >= 0 ? '+' : '';
+const medal = rank === 1 ? '🥇 ' : rank === 2 ? '🥈 ' : rank === 3 ? '🥉 ' : '🔹 ';
+output += `${medal}**#${rank}** ${name} • \`${sign}${value}\`\n`;
+}
+
+const embed = new EmbedBuilder()
+.setTitle('🏆 Fifty50 Leaderboard 🏆')
+.setDescription(output || 'No records yet!')
+.setColor(0x00AE86)
+.setTimestamp()
+.setFooter({ text: 'Fifty50 Betting Community' });
+
+const messages = await lbChannel.messages.fetch({ limit: 5 });
+await lbChannel.bulkDelete(messages);
+lbChannel.send({ embeds: [embed] });
+}
+
+// ====== INTERACTION HANDLER ======
 client.on('interactionCreate', async interaction => {
-    if (!interaction.isChatInputCommand()) return;
-    const { commandName, options, user } = interaction;
+if (!interaction.isChatInputCommand()) return;
+const { commandName, options, user } = interaction;
 
-    // FOLLOW
-    if (commandName === 'follow') {
-        const target = options.getUser('target');
-        if (!followers[user.id]) followers[user.id] = [];
-        if (!followers[user.id].includes(target.id)) {
-            followers[user.id].push(target.id);
-            saveFollowers();
-            await interaction.reply(`You are now following **${target.username}**`);
-        } else {
-            await interaction.reply(`You are already following **${target.username}**`);
-        }
-    }
+if (commandName === 'follow') {
+const target = options.getUser('target');
+if (!followers[user.id]) followers[user.id] = [];
+if (!followers[user.id].includes(target.id)) {
+followers[user.id].push(target.id);
+saveFollowers();
+await interaction.reply(`You are now following **${target.username}**`);
+} else {
+await interaction.reply(`You are already following **${target.username}**`);
+}
+}
 
-    // UNFOLLOW
-    if (commandName === 'unfollow') {
-        const target = options.getUser('target');
-        if (followers[user.id]) {
-            followers[user.id] = followers[user.id].filter(id => id !== target.id);
-            saveFollowers();
-        }
-        await interaction.reply(`You unfollowed **${target.username}**`);
-    }
+if (commandName === 'unfollow') {
+const target = options.getUser('target');
+if (followers[user.id]) {
+followers[user.id] = followers[user.id].filter(id => id !== target.id);
+saveFollowers();
+}
+await interaction.reply(`You unfollowed **${target.username}**`);
+}
 
-    // FOLLOWING LIST
-    if (commandName === 'following') {
-        const followed = followers[user.id] || [];
-        if (followed.length === 0) return interaction.reply('You are not following anyone.');
-        let names = followed.map(id => client.users.cache.get(id)?.username || 'Unknown').join('\n- ');
-        await interaction.reply(`You are following:\n- ${names}`);
-    }
+if (commandName === 'following') {
+const followed = followers[user.id] || [];
+if (followed.length === 0) return interaction.reply('You are not following anyone.');
+let names = followed.map(id => client.users.cache.get(id)?.username || 'Unknown').join('\n- ');
+await interaction.reply(`You are following:\n- ${names}`);
+}
 
-    // FEED
-    if (commandName === 'feed') {
-        const followed = followers[user.id] || [];
-        if (followed.length === 0) return interaction.reply('You are not following anyone.');
-        let recentSlips = slips
-            .filter(slip => followed.includes(slip.userId))
-            .slice(-5)
-            .map(slip => `${slip.username}: ${slip.content} ${slip.attachmentUrl || ''}`)
-            .join('\n\n');
-        await interaction.reply(recentSlips || 'No recent slips from followed users.');
-    }
+if (commandName === 'feed') {
+const followed = followers[user.id] || [];
+if (followed.length === 0) return interaction.reply('No recent slips from followed users.');
+let recentSlips = slips
+.filter(slip => followed.includes(slip.userId))
+.slice(-5)
+.map(slip => `${slip.username}: ${slip.content} ${slip.attachmentUrl || ''}`)
+.join('\n\n');
+await interaction.reply(recentSlips || 'No recent slips from followed users.');
+}
 
-    // ALERTS ON/OFF
-    if (commandName === 'alerts') {
-        const toggle = options.getString('state');
-        alerts[user.id] = toggle.toLowerCase() === 'on';
-        saveAlerts();
-        await interaction.reply(`DM alerts turned **${toggle.toUpperCase()}**`);
-    }
+if (commandName === 'alerts') {
+const toggle = options.getString('state');
+alerts[user.id] = toggle.toLowerCase() === 'on';
+saveAlerts();
+await interaction.reply(`DM alerts turned **${toggle.toUpperCase()}**`);
+}
 
-    // VERIFY WIN (admin only)
-    if (commandName === 'verifywin') {
-        if (!interaction.member.permissions.has(PermissionFlagsBits.ManageGuild)) {
-            return interaction.reply({ content: 'You do not have permission to use this command.', ephemeral: true });
-        }
-        const target = options.getUser('target');
-        if (!leaderboard[target.id]) leaderboard[target.id] = 0;
-        leaderboard[target.id] += 1;
-        saveLeaderboard();
+if (commandName === 'addwin') {
+if (!interaction.member.permissions.has(PermissionFlagsBits.ManageGuild)) {
+return interaction.reply({ content: 'No permission.', ephemeral: true });
+}
+const name = options.getString('name');
+const odds = options.getInteger('odds');
+if (!leaderboard[name]) leaderboard[name] = 0;
+leaderboard[name] += odds;
+saveLeaderboard();
+updateLeaderboardEmbed(interaction.guild);
+await interaction.reply(`Added win for ${name}`);
+}
 
-        const channel = interaction.guild.channels.cache.find(ch => ch.name === 'leaderboard');
-        if (channel) {
-            let leaderboardText = Object.entries(leaderboard)
-                .sort((a, b) => b[1] - a[1])
-                .map(([id, wins], index) => `${index + 1}. <@${id}> - ${wins} wins`)
-                .join('\n');
-            await channel.send(`FIFTY50 LEADERBOARD\n${leaderboardText}`);
-        }
-
-        await interaction.reply(`Recorded win for ${target.username}`);
-    }
-
-    // ADD WIN (slash command)
-    if (commandName === 'addwin') {
-        if (!interaction.member.permissions.has(PermissionFlagsBits.ManageGuild)) {
-            return interaction.reply({ content: 'You do not have permission to use this command.', ephemeral: true });
-        }
-        const name = options.getString('name');
-        const odds = options.getInteger('odds');
-
-        if (!leaderboard[name]) leaderboard[name] = 0;
-        leaderboard[name] += odds;
-        saveLeaderboard();
-
-        // Send reply FIRST
-        await interaction.reply(`Added ${odds > 0 ? '+' : ''}${odds} to ${name}'s record`);
-
-        const lbChannel = interaction.guild.channels.cache.find(ch => ch.name.includes('leaderboards'));
-        if (lbChannel) {
-            const sorted = Object.entries(leaderboard).sort((a, b) => b[1] - a[1]).slice(0, 10);
-            let output = '';
-            let rank = 1;
-
-            for (let i = 0; i < sorted.length; i++) {
-                const [username, value] = sorted[i];
-                if (i > 0 && value === sorted[i - 1][1]) {
-                    // tie
-                } else {
-                    rank = i + 1;
-                }
-                const sign = value >= 0 ? '+' : '';
-                const medal = rank === 1 ? '🥇 ' : rank === 2 ? '🥈 ' : rank === 3 ? '🥉 ' : '🔹 ';
-                output += `${medal}**#${rank}** ${username} • \`${sign}${value}\`\n`;
-            }
-
-            const embed = new EmbedBuilder()
-                .setTitle('🏆 Fifty50 Leaderboard 🏆')
-                .setDescription(output || 'No records yet!')
-                .setColor(0x00AE86)
-                .setTimestamp()
-                .setFooter({ text: 'Fifty50 Betting Community' });
-
-            const messages = await lbChannel.messages.fetch({ limit: 5 });
-            await lbChannel.bulkDelete(messages);
-            await lbChannel.send({ embeds: [embed] });
-        }
-    }
-
-    // RESET LEADERBOARD (admin only)
-    if (commandName === 'resetleaderboard') {
-        if (!interaction.member.permissions.has(PermissionFlagsBits.ManageGuild)) {
-            return interaction.reply({ content: 'You do not have permission to use this command.', ephemeral: true });
-        }
-        
-        leaderboard = {};
-        saveLeaderboard();
-
-        await interaction.reply('Leaderboard has been completely reset.');
-
-        const lbChannel = interaction.guild.channels.cache.find(ch => ch.name.includes('leaderboards'));
-        if (lbChannel) {
-            const messages = await lbChannel.messages.fetch({ limit: 5 });
-            await lbChannel.bulkDelete(messages);
-            
-            const embed = new EmbedBuilder()
-                .setTitle('🏆 Fifty50 Leaderboard 🏆')
-                .setDescription('Leaderboard has been reset. No records yet!')
-                .setColor(0x00AE86)
-                .setTimestamp()
-                .setFooter({ text: 'Fifty50 Betting Community' });
-                
-            await lbChannel.send({ embeds: [embed] });
-        }
-    }
+if (commandName === 'resetleaderboard') {
+if (!interaction.member.permissions.has(PermissionFlagsBits.ManageGuild)) {
+return interaction.reply({ content: 'No permission.', ephemeral: true });
+}
+leaderboard = {};
+saveLeaderboard();
+updateLeaderboardEmbed(interaction.guild);
+await interaction.reply('Leaderboard reset.');
+}
 });
 
 // ====== LOGIN ======
-const token = process.env.DISCORD_BOT_TOKEN;
-if (!token) {
-    console.error('❌ ERROR: DISCORD_BOT_TOKEN is not set!');
-    process.exit(1);
+client.login(process.env.DISCORD_BOT_TOKEN);
+
+// ====== STRIPE WEBHOOK SERVER ======
+const app = express();
+app.use('/webhook', express.raw({ type: 'application/json' }));
+
+app.post('/webhook', async (req, res) => {
+const sig = req.headers['stripe-signature'];
+let event;
+
+try {
+event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
+} catch (err) {
+console.log('Webhook signature verification failed:', err.message);
+return res.status(400).send(`Webhook Error: ${err.message}`);
 }
-client.login(token); 
+
+// ====== ASSIGN PAID ROLE ======
+if (event.type === 'checkout.session.completed') {
+const session = event.data.object;
+const discordId = session.metadata.discord_user_id;
+const guild = client.guilds.cache.first();
+const member = guild?.members.cache.get(discordId);
+if (member) {
+const role = guild.roles.cache.find(r => r.name === 'PAID');
+if (role) member.roles.add(role).catch(console.log);
+}
+}
+
+// ====== REMOVE PAID ROLE ======
+if (event.type === 'invoice.payment_failed' || event.type === 'customer.subscription.deleted') {
+const subscription = event.data.object;
+const discordId = subscription.metadata?.discord_user_id;
+const guild = client.guilds.cache.first();
+const member = guild?.members.cache.get(discordId);
+if (member) {
+const role = guild.roles.cache.find(r => r.name === 'PAID');
+if (role) member.roles.remove(role).catch(console.log);
+}
+}
+
+res.json({ received: true });
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Stripe webhook server running on port ${PORT}`));
