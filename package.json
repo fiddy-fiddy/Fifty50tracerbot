@@ -7,7 +7,9 @@
     "start": "node index.js"
   },
   "dependencies": {
-    "discord.js": "^14.14.1"
+    "discord.js": "^14.14.1",
+    "express": "^4.18.0",
+    "pg": "^8.11.0",
+    "stripe": "^14.0.0"
   }
 }
-
