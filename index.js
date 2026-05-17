@@ -1,15 +1,20 @@
+// FiddyBot - Discord bot with Stripe Payment Link integration
+// Deploy this to Railway. Required env vars:
+//   DISCORD_BOT_TOKEN, DISCORD_GUILD_ID, DISCORD_ROLE_ID,
+//   STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, PORT (Railway sets this)
+
 const { Client, GatewayIntentBits, Partials, PermissionFlagsBits, EmbedBuilder } = require('discord.js');
 const fs = require('fs');
-const { Pool } = require('pg');
-const Stripe = require('stripe');
 const express = require('express');
+const Stripe = require('stripe');
 
-// ====== DISCORD CLIENT ======
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+
 const client = new Client({
     intents: [
         GatewayIntentBits.Guilds,
         GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.GuildMembers,   // <-- added for subscription role management
+        GatewayIntentBits.GuildMembers,
         GatewayIntentBits.MessageContent
     ],
     partials: [Partials.Channel]
@@ -20,69 +25,25 @@ let followers = {};
 let slips = [];
 let leaderboard = {};
 let alerts = {};
+let subscribers = {}; // stripe_customer_id -> discord_user_id
 
 const FOLLOWERS_FILE = './followers.json';
 const SLIPS_FILE = './slips.json';
 const LEADERBOARD_FILE = './leaderboard.json';
 const ALERTS_FILE = './alerts.json';
+const SUBSCRIBERS_FILE = './subscribers.json';
 
 if (fs.existsSync(FOLLOWERS_FILE)) followers = JSON.parse(fs.readFileSync(FOLLOWERS_FILE));
 if (fs.existsSync(SLIPS_FILE)) slips = JSON.parse(fs.readFileSync(SLIPS_FILE));
 if (fs.existsSync(LEADERBOARD_FILE)) leaderboard = JSON.parse(fs.readFileSync(LEADERBOARD_FILE));
 if (fs.existsSync(ALERTS_FILE)) alerts = JSON.parse(fs.readFileSync(ALERTS_FILE));
+if (fs.existsSync(SUBSCRIBERS_FILE)) subscribers = JSON.parse(fs.readFileSync(SUBSCRIBERS_FILE));
 
 function saveFollowers() { fs.writeFileSync(FOLLOWERS_FILE, JSON.stringify(followers, null, 2)); }
 function saveSlips() { fs.writeFileSync(SLIPS_FILE, JSON.stringify(slips, null, 2)); }
 function saveLeaderboard() { fs.writeFileSync(LEADERBOARD_FILE, JSON.stringify(leaderboard, null, 2)); }
 function saveAlerts() { fs.writeFileSync(ALERTS_FILE, JSON.stringify(alerts, null, 2)); }
-
-// ====== DATABASE (shared with Replit web app) ======
-const pool = new Pool({ connectionString: process.env.DATABASE_URL });
-
-async function getUserByDiscordId(discordId) {
-    const { rows } = await pool.query('SELECT * FROM users WHERE discord_id = $1', [discordId]);
-    return rows[0] || null;
-}
-
-async function getUserByStripeCustomerId(customerId) {
-    const { rows } = await pool.query('SELECT * FROM users WHERE stripe_customer_id = $1', [customerId]);
-    return rows[0] || null;
-}
-
-async function setSubscribed(discordId, stripeCustomerId, subscriptionId, isSubscribed) {
-    await pool.query(
-        `UPDATE users SET stripe_customer_id = $2, stripe_subscription_id = $3, is_subscribed = $4 WHERE discord_id = $1`,
-        [discordId, stripeCustomerId, subscriptionId, isSubscribed]
-    );
-}
-
-// ====== SUBSCRIPTION ROLE HELPERS ======
-async function assignPaidRole(discordId) {
-    try {
-        const guild = await client.guilds.fetch(process.env.DISCORD_GUILD_ID);
-        const member = await guild.members.fetch(discordId).catch(() => null);
-        if (member) {
-            await member.roles.add(process.env.DISCORD_ROLE_ID);
-            console.log(`Assigned paid role to ${discordId}`);
-        }
-    } catch (err) {
-        console.error('assignPaidRole error:', err);
-    }
-}
-
-async function removePaidRoleAndKick(discordId) {
-    try {
-        const guild = await client.guilds.fetch(process.env.DISCORD_GUILD_ID);
-        const member = await guild.members.fetch(discordId).catch(() => null);
-        if (member) {
-            await member.roles.remove(process.env.DISCORD_ROLE_ID);
-            await member.kick('Subscription canceled');
-            console.log(`Removed role and kicked ${discordId}`);
-        }
-    } catch (err) {
-        console.error('removePaidRoleAndKick error:', err);
-    }
-}
+function saveSubscribers() { fs.writeFileSync(SUBSCRIBERS_FILE, JSON.stringify(subscribers, null, 2)); }
 
 // ====== BOT READY & COMMAND REGISTRATION ======
 client.once('ready', async () => {
@@ -111,19 +72,6 @@ client.once('ready', async () => {
     }
 });
 
-// ====== WHEN SOMEONE JOINS — AUTO-ASSIGN ROLE IF SUBSCRIBED ======
-client.on('guildMemberAdd', async (member) => {
-    try {
-        const user = await getUserByDiscordId(member.id);
-        if (user && user.is_subscribed) {
-            await member.roles.add(process.env.DISCORD_ROLE_ID);
-            console.log(`Auto-assigned paid role to ${member.id} on join`);
-        }
-    } catch (err) {
-        console.error('guildMemberAdd error:', err);
-    }
-});
-
 // ====== LOG ALL SLIPS AND SEND ALERTS ======
 client.on('messageCreate', async message => {
     if (message.channel.name !== 'bet-slips') return;
@@ -149,3 +97,225 @@ client.on('messageCreate', async message => {
                 console.log(`Failed to DM ${followerId}: ${err}`);
             }
         }
+    }
+});
+
+// ====== AUTO LEADERBOARD TRACKING ======
+const WINS_CHANNEL = 'wins';
+
+client.on('messageCreate', async (message) => {
+    if (message.author.bot || !message.guild) return;
+    if (message.channel.name !== WINS_CHANNEL) return;
+
+    const lines = message.content.split('\n');
+    for (const line of lines) {
+        const match = line.trim().match(/^(.+?)\s([+-]\d+)$/);
+        if (!match) continue;
+
+        const name = match[1];
+        const odds = parseInt(match[2]);
+        if (!leaderboard[name]) leaderboard[name] = 0;
+        leaderboard[name] += odds;
+    }
+
+    saveLeaderboard();
+    updateLeaderboardEmbed(message.guild);
+});
+
+async function updateLeaderboardEmbed(guild) {
+    const lbChannel = guild.channels.cache.find(c => c.name.toLowerCase().includes('leaderboard'));
+    if (!lbChannel) return;
+
+    const sorted = Object.entries(leaderboard).sort((a, b) => b[1] - a[1]).slice(0, 10);
+    let output = '';
+    let rank = 1;
+
+    for (let i = 0; i < sorted.length; i++) {
+        const [name, value] = sorted[i];
+        if (i > 0 && value !== sorted[i - 1][1]) rank = i + 1;
+        const sign = value >= 0 ? '+' : '';
+        const medal = rank === 1 ? '🥇 ' : rank === 2 ? '🥈 ' : rank === 3 ? '🥉 ' : '🔹 ';
+        output += `${medal}**#${rank}** ${name} • \`${sign}${value}\`\n`;
+    }
+
+    const embed = new EmbedBuilder()
+        .setTitle('🏆 Fifty50 Leaderboard 🏆')
+        .setDescription(output || 'No records yet!')
+        .setColor(0x00AE86)
+        .setTimestamp()
+        .setFooter({ text: 'Fifty50 Betting Community' });
+
+    const messages = await lbChannel.messages.fetch({ limit: 5 });
+    await lbChannel.bulkDelete(messages);
+    lbChannel.send({ embeds: [embed] });
+}
+
+// ====== INTERACTION HANDLER ======
+client.on('interactionCreate', async interaction => {
+    if (!interaction.isChatInputCommand()) return;
+    const { commandName, options, user } = interaction;
+
+    if (commandName === 'follow') {
+        const target = options.getUser('target');
+        if (!followers[user.id]) followers[user.id] = [];
+        if (!followers[user.id].includes(target.id)) {
+            followers[user.id].push(target.id);
+            saveFollowers();
+            await interaction.reply(`You are now following **${target.username}**`);
+        } else {
+            await interaction.reply(`You are already following **${target.username}**`);
+        }
+    }
+
+    if (commandName === 'unfollow') {
+        const target = options.getUser('target');
+        if (followers[user.id]) {
+            followers[user.id] = followers[user.id].filter(id => id !== target.id);
+            saveFollowers();
+        }
+        await interaction.reply(`You unfollowed **${target.username}**`);
+    }
+
+    if (commandName === 'following') {
+        const followed = followers[user.id] || [];
+        if (followed.length === 0) return interaction.reply('You are not following anyone.');
+        let names = followed.map(id => client.users.cache.get(id)?.username || 'Unknown').join('\n- ');
+        await interaction.reply(`You are following:\n- ${names}`);
+    }
+
+    if (commandName === 'feed') {
+        const followed = followers[user.id] || [];
+        if (followed.length === 0) return interaction.reply('You are not following anyone.');
+        let recentSlips = slips
+            .filter(slip => followed.includes(slip.userId))
+            .slice(-5)
+            .map(slip => `${slip.username}: ${slip.content} ${slip.attachmentUrl || ''}`)
+            .join('\n\n');
+        await interaction.reply(recentSlips || 'No recent slips from followed users.');
+    }
+
+    if (commandName === 'alerts') {
+        const toggle = options.getString('state');
+        alerts[user.id] = toggle.toLowerCase() === 'on';
+        saveAlerts();
+        await interaction.reply(`DM alerts turned **${toggle.toUpperCase()}**`);
+    }
+
+    if (commandName === 'addwin') {
+        if (!interaction.member.permissions.has(PermissionFlagsBits.ManageGuild)) {
+            return interaction.reply({ content: 'No permission.', ephemeral: true });
+        }
+        const name = options.getString('name');
+        const odds = options.getInteger('odds');
+        if (!leaderboard[name]) leaderboard[name] = 0;
+        leaderboard[name] += odds;
+        saveLeaderboard();
+        updateLeaderboardEmbed(interaction.guild);
+        await interaction.reply(`Added win for ${name}`);
+    }
+
+    if (commandName === 'resetleaderboard') {
+        if (!interaction.member.permissions.has(PermissionFlagsBits.ManageGuild)) {
+            return interaction.reply({ content: 'No permission.', ephemeral: true });
+        }
+        leaderboard = {};
+        saveLeaderboard();
+        updateLeaderboardEmbed(interaction.guild);
+        await interaction.reply('Leaderboard reset.');
+    }
+});
+
+// ====== STRIPE WEBHOOK SERVER ======
+async function findMemberByUsername(guild, username) {
+    const clean = username.trim().toLowerCase().replace(/^@/, '').split('#')[0];
+    await guild.members.fetch();
+    return guild.members.cache.find(m => {
+        const u = m.user.username.toLowerCase();
+        const n = (m.nickname || '').toLowerCase();
+        const g = (m.user.globalName || '').toLowerCase();
+        return u === clean || n === clean || g === clean;
+    });
+}
+
+async function assignRoleByUsername(username, customerId) {
+    try {
+        const guild = await client.guilds.fetch(process.env.DISCORD_GUILD_ID);
+        const member = await findMemberByUsername(guild, username);
+        if (!member) {
+            console.log(`Could not find Discord user: ${username}`);
+            return;
+        }
+        await member.roles.add(process.env.DISCORD_ROLE_ID);
+        subscribers[customerId] = member.id;
+        saveSubscribers();
+        console.log(`Assigned PAID role to ${member.user.username}`);
+        try { await member.send(`Welcome! Your subscription is active and your PAID role has been assigned.`); } catch {}
+    } catch (err) {
+        console.error('Error assigning role:', err);
+    }
+}
+
+async function removeRoleAndKick(customerId) {
+    try {
+        const discordId = subscribers[customerId];
+        if (!discordId) return;
+        const guild = await client.guilds.fetch(process.env.DISCORD_GUILD_ID);
+        const member = await guild.members.fetch(discordId).catch(() => null);
+        if (member) {
+            await member.roles.remove(process.env.DISCORD_ROLE_ID).catch(() => {});
+            try { await member.send(`Your subscription has been canceled. You have been removed from the server.`); } catch {}
+            await member.kick('Subscription canceled').catch(() => {});
+            console.log(`Removed role and kicked ${member.user.username}`);
+        }
+        delete subscribers[customerId];
+        saveSubscribers();
+    } catch (err) {
+        console.error('Error removing role:', err);
+    }
+}
+
+const app = express();
+
+app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+    const sig = req.headers['stripe-signature'];
+    let event;
+    try {
+        event = stripe.webhooks.constructEvent(req.body, sig, process.env.STRIPE_WEBHOOK_SECRET);
+    } catch (err) {
+        console.error('Webhook signature verification failed:', err.message);
+        return res.status(400).send(`Webhook Error: ${err.message}`);
+    }
+
+    if (event.type === 'checkout.session.completed') {
+        const session = event.data.object;
+        const customerId = session.customer;
+        let username = null;
+        if (session.custom_fields && session.custom_fields.length) {
+            const field = session.custom_fields.find(f =>
+                (f.key || '').toLowerCase().includes('discord') ||
+                (f.label && f.label.custom && f.label.custom.toLowerCase().includes('discord'))
+            );
+            if (field && field.text) username = field.text.value;
+        }
+        if (username && customerId) {
+            await assignRoleByUsername(username, customerId);
+        } else {
+            console.log('Missing username or customer ID in checkout session');
+        }
+    }
+
+    if (event.type === 'customer.subscription.deleted') {
+        const sub = event.data.object;
+        await removeRoleAndKick(sub.customer);
+    }
+
+    res.json({ received: true });
+});
+
+app.get('/', (_req, res) => res.send('FiddyBot is running!'));
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Webhook server listening on port ${PORT}`));
+
+// ====== LOGIN ======
+client.login(process.env.DISCORD_BOT_TOKEN);
