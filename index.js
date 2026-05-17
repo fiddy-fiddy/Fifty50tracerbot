@@ -26,24 +26,28 @@ let slips = [];
 let leaderboard = {};
 let alerts = {};
 let subscribers = {}; // stripe_customer_id -> discord_user_id
+let pending = {}; // lowercased_discord_username -> stripe_customer_id (paid but not in server yet)
 
 const FOLLOWERS_FILE = './followers.json';
 const SLIPS_FILE = './slips.json';
 const LEADERBOARD_FILE = './leaderboard.json';
 const ALERTS_FILE = './alerts.json';
 const SUBSCRIBERS_FILE = './subscribers.json';
+const PENDING_FILE = './pending.json';
 
 if (fs.existsSync(FOLLOWERS_FILE)) followers = JSON.parse(fs.readFileSync(FOLLOWERS_FILE));
 if (fs.existsSync(SLIPS_FILE)) slips = JSON.parse(fs.readFileSync(SLIPS_FILE));
 if (fs.existsSync(LEADERBOARD_FILE)) leaderboard = JSON.parse(fs.readFileSync(LEADERBOARD_FILE));
 if (fs.existsSync(ALERTS_FILE)) alerts = JSON.parse(fs.readFileSync(ALERTS_FILE));
 if (fs.existsSync(SUBSCRIBERS_FILE)) subscribers = JSON.parse(fs.readFileSync(SUBSCRIBERS_FILE));
+if (fs.existsSync(PENDING_FILE)) pending = JSON.parse(fs.readFileSync(PENDING_FILE));
 
 function saveFollowers() { fs.writeFileSync(FOLLOWERS_FILE, JSON.stringify(followers, null, 2)); }
 function saveSlips() { fs.writeFileSync(SLIPS_FILE, JSON.stringify(slips, null, 2)); }
 function saveLeaderboard() { fs.writeFileSync(LEADERBOARD_FILE, JSON.stringify(leaderboard, null, 2)); }
 function saveAlerts() { fs.writeFileSync(ALERTS_FILE, JSON.stringify(alerts, null, 2)); }
 function saveSubscribers() { fs.writeFileSync(SUBSCRIBERS_FILE, JSON.stringify(subscribers, null, 2)); }
+function savePending() { fs.writeFileSync(PENDING_FILE, JSON.stringify(pending, null, 2)); }
 
 // ====== BOT READY & COMMAND REGISTRATION ======
 client.once('ready', async () => {
@@ -242,7 +246,11 @@ async function assignRoleByUsername(username, customerId) {
         const guild = await client.guilds.fetch(process.env.DISCORD_GUILD_ID);
         const member = await findMemberByUsername(guild, username);
         if (!member) {
-            console.log(`Could not find Discord user: ${username}`);
+            // User hasn't joined the server yet — remember them and assign role when they join
+            const key = username.trim().toLowerCase().replace(/^@/, '').split('#')[0];
+            pending[key] = customerId;
+            savePending();
+            console.log(`User ${username} paid but not in server yet — saved as pending`);
             return;
         }
         await member.roles.add(process.env.DISCORD_ROLE_ID);
@@ -254,6 +262,33 @@ async function assignRoleByUsername(username, customerId) {
         console.error('Error assigning role:', err);
     }
 }
+
+// When someone joins the server, check if they have a pending paid subscription
+client.on('guildMemberAdd', async (member) => {
+    try {
+        const candidates = [
+            member.user.username,
+            member.user.globalName,
+            member.nickname
+        ].filter(Boolean).map(n => n.toLowerCase());
+
+        for (const name of candidates) {
+            if (pending[name]) {
+                const customerId = pending[name];
+                await member.roles.add(process.env.DISCORD_ROLE_ID);
+                subscribers[customerId] = member.id;
+                delete pending[name];
+                saveSubscribers();
+                savePending();
+                console.log(`New member ${member.user.username} matched pending payment — role assigned`);
+                try { await member.send(`Welcome! Your subscription is active and your PAID role has been assigned.`); } catch {}
+                return;
+            }
+        }
+    } catch (err) {
+        console.error('Error in guildMemberAdd:', err);
+    }
+});
 
 async function removeRoleAndKick(customerId) {
     try {
