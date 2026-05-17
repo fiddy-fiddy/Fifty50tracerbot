@@ -292,18 +292,49 @@ client.on('guildMemberAdd', async (member) => {
 
 async function removeRoleAndKick(customerId) {
     try {
-        const discordId = subscribers[customerId];
-        if (!discordId) return;
         const guild = await client.guilds.fetch(process.env.DISCORD_GUILD_ID);
-        const member = await guild.members.fetch(discordId).catch(() => null);
+        let member = null;
+        let discordId = subscribers[customerId];
+
+        if (discordId) {
+            member = await guild.members.fetch(discordId).catch(() => null);
+        }
+
+        // Fallback: look up the customer's checkout session in Stripe to find their Discord username
+        if (!member) {
+            console.log(`No mapping for customer ${customerId} — querying Stripe...`);
+            try {
+                const sessions = await stripe.checkout.sessions.list({ customer: customerId, limit: 1 });
+                if (sessions.data.length) {
+                    const session = sessions.data[0];
+                    let username = null;
+                    if (session.custom_fields && session.custom_fields.length) {
+                        const field = session.custom_fields.find(f =>
+                            (f.key || '').toLowerCase().includes('discord') ||
+                            (f.label && f.label.custom && f.label.custom.toLowerCase().includes('discord'))
+                        );
+                        if (field && field.text) username = field.text.value;
+                    }
+                    if (username) {
+                        member = await findMemberByUsername(guild, username);
+                        const key = username.trim().toLowerCase().replace(/^@/, '').split('#')[0];
+                        if (pending[key]) { delete pending[key]; savePending(); }
+                    }
+                }
+            } catch (e) {
+                console.error('Stripe lookup failed:', e.message);
+            }
+        }
+
         if (member) {
             await member.roles.remove(process.env.DISCORD_ROLE_ID).catch(() => {});
             try { await member.send(`Your subscription has been canceled. You have been removed from the server.`); } catch {}
             await member.kick('Subscription canceled').catch(() => {});
             console.log(`Removed role and kicked ${member.user.username}`);
+        } else {
+            console.log(`Could not find member to kick for customer ${customerId}`);
         }
-        delete subscribers[customerId];
-        saveSubscribers();
+        if (subscribers[customerId]) { delete subscribers[customerId]; saveSubscribers(); }
     } catch (err) {
         console.error('Error removing role:', err);
     }
