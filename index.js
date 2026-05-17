@@ -1,4 +1,4 @@
-// FiddyBot - Discord bot with Stripe Payment Link + Discord OAuth integration
+ // FiddyBot - Discord bot with Stripe Payment Link + Discord OAuth integration
 // Deploy this to Railway. Required env vars:
 //   DISCORD_BOT_TOKEN, DISCORD_GUILD_ID, DISCORD_ROLE_ID,
 //   DISCORD_CLIENT_ID, DISCORD_CLIENT_SECRET,
@@ -112,10 +112,42 @@ function saveSlips() { fs.writeFileSync(SLIPS_FILE, JSON.stringify(slips, null, 
 function saveLeaderboard() { fs.writeFileSync(LEADERBOARD_FILE, JSON.stringify(leaderboard, null, 2)); }
 function saveAlerts() { fs.writeFileSync(ALERTS_FILE, JSON.stringify(alerts, null, 2)); }
 
+// ====== SWEEP: kick anyone without PAID role or admin perms ======
+async function sweepUnpaidMembers() {
+    try {
+        const guild = await client.guilds.fetch(process.env.DISCORD_GUILD_ID);
+        const roleId = process.env.DISCORD_ROLE_ID;
+        const members = await guild.members.fetch();
+        let kicked = 0;
+        for (const member of members.values()) {
+            if (member.user.bot) continue;
+            if (member.id === guild.ownerId) continue;
+            if (member.permissions.has(PermissionFlagsBits.Administrator)) continue;
+            if (member.permissions.has(PermissionFlagsBits.ManageGuild)) continue;
+            if (member.roles.cache.has(roleId)) continue;
+            try {
+                await member.send(`You were removed from the server because you don't have an active paid subscription. Subscribe again to rejoin.`).catch(() => {});
+                await member.kick('No paid role');
+                kicked++;
+                console.log(`Swept: kicked ${member.user.username}`);
+            } catch (e) {
+                console.error(`Failed to kick ${member.user.username}:`, e.message);
+            }
+        }
+        console.log(`Sweep complete: kicked ${kicked} unpaid members`);
+    } catch (err) {
+        console.error('Sweep failed:', err);
+    }
+}
+
 // ====== BOT READY & COMMAND REGISTRATION ======
 client.once('ready', async () => {
     console.log(`${client.user.tag} is online!`);
     try { await initDb(); } catch (e) { console.error('DB init failed:', e); }
+
+    // Run sweep on startup, then every 6 hours
+    sweepUnpaidMembers();
+    setInterval(sweepUnpaidMembers, 6 * 60 * 60 * 1000);
 
     const data = [
         { name: 'follow', description: 'Follow a bettor', options: [{ name: 'target', type: 6, description: 'User to follow', required: true }] },
@@ -426,6 +458,26 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
         await removeRoleAndKick(sub.customer);
     }
 
+    // Refund or dispute = kick immediately, and also cancel any active subscription
+    if (event.type === 'charge.refunded' || event.type === 'charge.dispute.created') {
+        const charge = event.data.object;
+        const customerId = charge.customer;
+        if (customerId) {
+            console.log(`Refund/dispute for customer ${customerId} — canceling subscription and kicking`);
+            try {
+                const subs = await stripe.subscriptions.list({ customer: customerId, status: 'all', limit: 10 });
+                for (const sub of subs.data) {
+                    if (sub.status !== 'canceled') {
+                        await stripe.subscriptions.cancel(sub.id).catch(e => console.error('Cancel failed:', e.message));
+                    }
+                }
+            } catch (e) {
+                console.error('Subscription cancel on refund failed:', e.message);
+            }
+            await removeRoleAndKick(customerId);
+        }
+    }
+
     res.json({ received: true });
 });
 
@@ -540,7 +592,7 @@ app.get('/oauth/callback', async (req, res) => {
         res.send(htmlPage('Success', `
             <h1 class="success">You're in!</h1>
             <p>Your Discord account is connected and your PAID role is active. You can close this tab and open Discord.</p>
-                    `));
+        `));
     } catch (err) {
         console.error('OAuth callback error:', err);
         res.status(500).send(htmlPage('Error', `<h1 class="error">Something went wrong</h1><p>Please try the connect link again.</p>`));
