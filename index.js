@@ -1,7 +1,10 @@
-// FiddyBot - Discord bot with Stripe Payment Link integration
+// FiddyBot - Discord bot with Stripe Payment Link + Discord OAuth integration
 // Deploy this to Railway. Required env vars:
 //   DISCORD_BOT_TOKEN, DISCORD_GUILD_ID, DISCORD_ROLE_ID,
-//   STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET, PORT (Railway sets this)
+//   DISCORD_CLIENT_ID, DISCORD_CLIENT_SECRET,
+//   STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET,
+//   PUBLIC_URL (e.g. https://fiddybot-production.up.railway.app),
+//   DATABASE_URL (Neon Postgres), PORT (Railway sets this)
 
 const { Client, GatewayIntentBits, Partials, PermissionFlagsBits, EmbedBuilder } = require('discord.js');
 const fs = require('fs');
@@ -28,8 +31,25 @@ async function initDb() {
             username_key TEXT PRIMARY KEY,
             customer_id TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS bot_checkout_sessions (
+            session_id TEXT PRIMARY KEY,
+            customer_id TEXT NOT NULL,
+            created_at TIMESTAMPTZ DEFAULT NOW()
+        );
     `);
     console.log('Database tables ready.');
+}
+
+async function dbSaveCheckoutSession(sessionId, customerId) {
+    await pool.query(
+        `INSERT INTO bot_checkout_sessions (session_id, customer_id) VALUES ($1, $2)
+         ON CONFLICT (session_id) DO UPDATE SET customer_id = EXCLUDED.customer_id`,
+        [sessionId, customerId]
+    );
+}
+async function dbGetCheckoutSession(sessionId) {
+    const r = await pool.query(`SELECT customer_id FROM bot_checkout_sessions WHERE session_id = $1`, [sessionId]);
+    return r.rows[0]?.customer_id || null;
 }
 
 async function dbSaveSubscriber(customerId, discordId, username) {
@@ -395,18 +415,9 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
     if (event.type === 'checkout.session.completed') {
         const session = event.data.object;
         const customerId = session.customer;
-        let username = null;
-        if (session.custom_fields && session.custom_fields.length) {
-            const field = session.custom_fields.find(f =>
-                (f.key || '').toLowerCase().includes('discord') ||
-                (f.label && f.label.custom && f.label.custom.toLowerCase().includes('discord'))
-            );
-            if (field && field.text) username = field.text.value;
-        }
-        if (username && customerId) {
-            await assignRoleByUsername(username, customerId);
-        } else {
-            console.log('Missing username or customer ID in checkout session');
+        if (customerId && session.id) {
+            await dbSaveCheckoutSession(session.id, customerId);
+            console.log(`Saved checkout session ${session.id} for customer ${customerId}`);
         }
     }
 
@@ -416,6 +427,124 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
     }
 
     res.json({ received: true });
+});
+
+// ====== DISCORD OAUTH CONNECT FLOW ======
+function publicUrl() {
+    return (process.env.PUBLIC_URL || '').replace(/\/$/, '');
+}
+function htmlPage(title, body) {
+    return `<!doctype html><html><head><meta charset="utf-8"><title>${title}</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0f1115;color:#fff;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;padding:20px}
+.card{background:#1a1d24;padding:40px;border-radius:12px;max-width:420px;width:100%;text-align:center;box-shadow:0 10px 40px rgba(0,0,0,.4)}
+h1{margin:0 0 12px;font-size:24px}
+p{color:#9aa3b2;line-height:1.5;margin:0 0 24px}
+a.btn{display:inline-block;background:#5865F2;color:#fff;padding:14px 28px;border-radius:8px;text-decoration:none;font-weight:600;font-size:16px}
+a.btn:hover{background:#4752c4}
+.success{color:#4ade80}
+.error{color:#f87171}
+</style></head><body><div class="card">${body}</div></body></html>`;
+}
+
+app.get('/connect', async (req, res) => {
+    const sessionId = req.query.session_id;
+    if (!sessionId) {
+        return res.status(400).send(htmlPage('Error', `<h1 class="error">Missing session</h1><p>This link is invalid. Please use the link from your Stripe receipt.</p>`));
+    }
+    const customerId = await dbGetCheckoutSession(sessionId);
+    if (!customerId) {
+        return res.status(404).send(htmlPage('Not found', `<h1 class="error">Payment not found yet</h1><p>Your payment is still processing. Please refresh this page in 30 seconds.</p>`));
+    }
+    const redirectUri = encodeURIComponent(`${publicUrl()}/oauth/callback`);
+    const clientId = process.env.DISCORD_CLIENT_ID;
+    const state = encodeURIComponent(sessionId);
+    const url = `https://discord.com/api/oauth2/authorize?client_id=${clientId}&redirect_uri=${redirectUri}&response_type=code&scope=identify%20guilds.join&state=${state}&prompt=consent`;
+    res.send(htmlPage('Connect Discord', `
+        <h1>Payment received!</h1>
+        <p>Click below to connect your Discord account and unlock your access.</p>
+        <a class="btn" href="${url}">Connect Discord</a>
+    `));
+});
+
+app.get('/oauth/callback', async (req, res) => {
+    const { code, state } = req.query;
+    if (!code || !state) {
+        return res.status(400).send(htmlPage('Error', `<h1 class="error">Missing code</h1><p>Something went wrong. Please try the connect link again.</p>`));
+    }
+    const sessionId = decodeURIComponent(state);
+    const customerId = await dbGetCheckoutSession(sessionId);
+    if (!customerId) {
+        return res.status(404).send(htmlPage('Error', `<h1 class="error">Session expired</h1><p>Please use the link from your Stripe receipt again.</p>`));
+    }
+
+    try {
+        // Exchange code for access token
+        const tokenRes = await fetch('https://discord.com/api/oauth2/token', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: new URLSearchParams({
+                client_id: process.env.DISCORD_CLIENT_ID,
+                client_secret: process.env.DISCORD_CLIENT_SECRET,
+                grant_type: 'authorization_code',
+                code,
+                redirect_uri: `${publicUrl()}/oauth/callback`
+            })
+        });
+        const tokenData = await tokenRes.json();
+        if (!tokenData.access_token) {
+            console.error('Token exchange failed:', tokenData);
+            return res.status(500).send(htmlPage('Error', `<h1 class="error">Connection failed</h1><p>Could not verify your Discord account. Please try again.</p>`));
+        }
+
+        // Get user info
+        const userRes = await fetch('https://discord.com/api/users/@me', {
+            headers: { Authorization: `Bearer ${tokenData.access_token}` }
+        });
+        const user = await userRes.json();
+        if (!user.id) {
+            console.error('User fetch failed:', user);
+            return res.status(500).send(htmlPage('Error', `<h1 class="error">Connection failed</h1><p>Could not read your Discord account.</p>`));
+        }
+
+        // Add user to guild with PAID role (or update if already a member)
+        const guildId = process.env.DISCORD_GUILD_ID;
+        const roleId = process.env.DISCORD_ROLE_ID;
+        const addRes = await fetch(`https://discord.com/api/guilds/${guildId}/members/${user.id}`, {
+            method: 'PUT',
+            headers: {
+                Authorization: `Bot ${process.env.DISCORD_BOT_TOKEN}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                access_token: tokenData.access_token,
+                roles: [roleId]
+            })
+        });
+
+        if (addRes.status === 204) {
+            // Already in server — just add the role
+            await fetch(`https://discord.com/api/guilds/${guildId}/members/${user.id}/roles/${roleId}`, {
+                method: 'PUT',
+                headers: { Authorization: `Bot ${process.env.DISCORD_BOT_TOKEN}` }
+            });
+        } else if (!addRes.ok) {
+            const errText = await addRes.text();
+            console.error('Failed to add member:', addRes.status, errText);
+        }
+
+        await dbSaveSubscriber(customerId, user.id, user.username);
+        console.log(`Connected ${user.username} (${user.id}) to customer ${customerId}`);
+
+        res.send(htmlPage('Success', `
+            <h1 class="success">You're in!</h1>
+            <p>Your Discord account is connected and your PAID role is active. You can close this tab and open Discord.</p>
+                    `));
+    } catch (err) {
+        console.error('OAuth callback error:', err);
+        res.status(500).send(htmlPage('Error', `<h1 class="error">Something went wrong</h1><p>Please try the connect link again.</p>`));
+    }
 });
 
 app.get('/', (_req, res) => res.send('FiddyBot is running!'));
