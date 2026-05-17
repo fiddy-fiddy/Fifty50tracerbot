@@ -7,8 +7,59 @@ const { Client, GatewayIntentBits, Partials, PermissionFlagsBits, EmbedBuilder }
 const fs = require('fs');
 const express = require('express');
 const Stripe = require('stripe');
+const { Pool } = require('pg');
 
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
+
+// ====== POSTGRES (Neon) FOR PERSISTENT SUBSCRIBER STORAGE ======
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: { rejectUnauthorized: false }
+});
+
+async function initDb() {
+    await pool.query(`
+        CREATE TABLE IF NOT EXISTS bot_subscribers (
+            customer_id TEXT PRIMARY KEY,
+            discord_id TEXT NOT NULL,
+            username TEXT
+        );
+        CREATE TABLE IF NOT EXISTS bot_pending (
+            username_key TEXT PRIMARY KEY,
+            customer_id TEXT NOT NULL
+        );
+    `);
+    console.log('Database tables ready.');
+}
+
+async function dbSaveSubscriber(customerId, discordId, username) {
+    await pool.query(
+        `INSERT INTO bot_subscribers (customer_id, discord_id, username) VALUES ($1, $2, $3)
+         ON CONFLICT (customer_id) DO UPDATE SET discord_id = EXCLUDED.discord_id, username = EXCLUDED.username`,
+        [customerId, discordId, username || null]
+    );
+}
+async function dbGetSubscriber(customerId) {
+    const r = await pool.query(`SELECT discord_id FROM bot_subscribers WHERE customer_id = $1`, [customerId]);
+    return r.rows[0]?.discord_id || null;
+}
+async function dbDeleteSubscriber(customerId) {
+    await pool.query(`DELETE FROM bot_subscribers WHERE customer_id = $1`, [customerId]);
+}
+async function dbSavePending(usernameKey, customerId) {
+    await pool.query(
+        `INSERT INTO bot_pending (username_key, customer_id) VALUES ($1, $2)
+         ON CONFLICT (username_key) DO UPDATE SET customer_id = EXCLUDED.customer_id`,
+        [usernameKey, customerId]
+    );
+}
+async function dbGetPending(usernameKey) {
+    const r = await pool.query(`SELECT customer_id FROM bot_pending WHERE username_key = $1`, [usernameKey]);
+    return r.rows[0]?.customer_id || null;
+}
+async function dbDeletePending(usernameKey) {
+    await pool.query(`DELETE FROM bot_pending WHERE username_key = $1`, [usernameKey]);
+}
 
 const client = new Client({
     intents: [
@@ -20,38 +71,31 @@ const client = new Client({
     partials: [Partials.Channel]
 });
 
-// ====== DATA STORAGE ======
+// ====== DATA STORAGE (JSON for bot features, DB for subscribers) ======
 let followers = {};
 let slips = [];
 let leaderboard = {};
 let alerts = {};
-let subscribers = {}; // stripe_customer_id -> discord_user_id
-let pending = {}; // lowercased_discord_username -> stripe_customer_id (paid but not in server yet)
 
 const FOLLOWERS_FILE = './followers.json';
 const SLIPS_FILE = './slips.json';
 const LEADERBOARD_FILE = './leaderboard.json';
 const ALERTS_FILE = './alerts.json';
-const SUBSCRIBERS_FILE = './subscribers.json';
-const PENDING_FILE = './pending.json';
 
 if (fs.existsSync(FOLLOWERS_FILE)) followers = JSON.parse(fs.readFileSync(FOLLOWERS_FILE));
 if (fs.existsSync(SLIPS_FILE)) slips = JSON.parse(fs.readFileSync(SLIPS_FILE));
 if (fs.existsSync(LEADERBOARD_FILE)) leaderboard = JSON.parse(fs.readFileSync(LEADERBOARD_FILE));
 if (fs.existsSync(ALERTS_FILE)) alerts = JSON.parse(fs.readFileSync(ALERTS_FILE));
-if (fs.existsSync(SUBSCRIBERS_FILE)) subscribers = JSON.parse(fs.readFileSync(SUBSCRIBERS_FILE));
-if (fs.existsSync(PENDING_FILE)) pending = JSON.parse(fs.readFileSync(PENDING_FILE));
 
 function saveFollowers() { fs.writeFileSync(FOLLOWERS_FILE, JSON.stringify(followers, null, 2)); }
 function saveSlips() { fs.writeFileSync(SLIPS_FILE, JSON.stringify(slips, null, 2)); }
 function saveLeaderboard() { fs.writeFileSync(LEADERBOARD_FILE, JSON.stringify(leaderboard, null, 2)); }
 function saveAlerts() { fs.writeFileSync(ALERTS_FILE, JSON.stringify(alerts, null, 2)); }
-function saveSubscribers() { fs.writeFileSync(SUBSCRIBERS_FILE, JSON.stringify(subscribers, null, 2)); }
-function savePending() { fs.writeFileSync(PENDING_FILE, JSON.stringify(pending, null, 2)); }
 
 // ====== BOT READY & COMMAND REGISTRATION ======
 client.once('ready', async () => {
     console.log(`${client.user.tag} is online!`);
+    try { await initDb(); } catch (e) { console.error('DB init failed:', e); }
 
     const data = [
         { name: 'follow', description: 'Follow a bettor', options: [{ name: 'target', type: 6, description: 'User to follow', required: true }] },
@@ -248,14 +292,12 @@ async function assignRoleByUsername(username, customerId) {
         if (!member) {
             // User hasn't joined the server yet — remember them and assign role when they join
             const key = username.trim().toLowerCase().replace(/^@/, '').split('#')[0];
-            pending[key] = customerId;
-            savePending();
+            await dbSavePending(key, customerId);
             console.log(`User ${username} paid but not in server yet — saved as pending`);
             return;
         }
         await member.roles.add(process.env.DISCORD_ROLE_ID);
-        subscribers[customerId] = member.id;
-        saveSubscribers();
+        await dbSaveSubscriber(customerId, member.id, member.user.username);
         console.log(`Assigned PAID role to ${member.user.username}`);
         try { await member.send(`Welcome! Your subscription is active and your PAID role has been assigned.`); } catch {}
     } catch (err) {
@@ -273,13 +315,11 @@ client.on('guildMemberAdd', async (member) => {
         ].filter(Boolean).map(n => n.toLowerCase());
 
         for (const name of candidates) {
-            if (pending[name]) {
-                const customerId = pending[name];
+            const customerId = await dbGetPending(name);
+            if (customerId) {
                 await member.roles.add(process.env.DISCORD_ROLE_ID);
-                subscribers[customerId] = member.id;
-                delete pending[name];
-                saveSubscribers();
-                savePending();
+                await dbSaveSubscriber(customerId, member.id, member.user.username);
+                await dbDeletePending(name);
                 console.log(`New member ${member.user.username} matched pending payment — role assigned`);
                 try { await member.send(`Welcome! Your subscription is active and your PAID role has been assigned.`); } catch {}
                 return;
@@ -294,7 +334,7 @@ async function removeRoleAndKick(customerId) {
     try {
         const guild = await client.guilds.fetch(process.env.DISCORD_GUILD_ID);
         let member = null;
-        let discordId = subscribers[customerId];
+        const discordId = await dbGetSubscriber(customerId);
 
         if (discordId) {
             member = await guild.members.fetch(discordId).catch(() => null);
@@ -318,7 +358,7 @@ async function removeRoleAndKick(customerId) {
                     if (username) {
                         member = await findMemberByUsername(guild, username);
                         const key = username.trim().toLowerCase().replace(/^@/, '').split('#')[0];
-                        if (pending[key]) { delete pending[key]; savePending(); }
+                        await dbDeletePending(key).catch(() => {});
                     }
                 }
             } catch (e) {
@@ -334,7 +374,7 @@ async function removeRoleAndKick(customerId) {
         } else {
             console.log(`Could not find member to kick for customer ${customerId}`);
         }
-        if (subscribers[customerId]) { delete subscribers[customerId]; saveSubscribers(); }
+        await dbDeleteSubscriber(customerId).catch(() => {});
     } catch (err) {
         console.error('Error removing role:', err);
     }
