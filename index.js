@@ -1,10 +1,11 @@
- // FiddyBot - Discord bot with Stripe Payment Link + Discord OAuth integration
+// FiddyBot - Discord bot with Stripe Payment Link + Discord OAuth integration
 // Deploy this to Railway. Required env vars:
 //   DISCORD_BOT_TOKEN, DISCORD_GUILD_ID, DISCORD_ROLE_ID,
 //   DISCORD_CLIENT_ID, DISCORD_CLIENT_SECRET,
 //   STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET,
 //   PUBLIC_URL (e.g. https://fiddybot-production.up.railway.app),
 //   DATABASE_URL (Neon Postgres), PORT (Railway sets this)
+//   SENDGRID_API_KEY, FROM_EMAIL (for emailing the connect link after payment)
 
 const { Client, GatewayIntentBits, Partials, PermissionFlagsBits, EmbedBuilder } = require('discord.js');
 const fs = require('fs');
@@ -450,6 +451,12 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
         if (customerId && session.id) {
             await dbSaveCheckoutSession(session.id, customerId);
             console.log(`Saved checkout session ${session.id} for customer ${customerId}`);
+            const email = (session.customer_details && session.customer_details.email) || session.customer_email;
+            if (email) {
+                await sendConnectEmail(email, session.id).catch(e => console.error('Email send failed:', e.message));
+            } else {
+                console.log('No customer email on checkout session — could not send connect link');
+            }
         }
     }
 
@@ -484,6 +491,43 @@ app.post('/webhook', express.raw({ type: 'application/json' }), async (req, res)
 // ====== DISCORD OAUTH CONNECT FLOW ======
 function publicUrl() {
     return (process.env.PUBLIC_URL || '').replace(/\/$/, '');
+}
+
+// Send the "Connect Discord" link by email via SendGrid
+async function sendConnectEmail(toEmail, sessionId) {
+    if (!process.env.SENDGRID_API_KEY || !process.env.FROM_EMAIL) {
+        console.log('SendGrid not configured (SENDGRID_API_KEY / FROM_EMAIL) — skipping email');
+        return;
+    }
+    const link = `${publicUrl()}/connect?session_id=${sessionId}`;
+    const html = `
+        <div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:24px">
+            <h2>Thanks for subscribing!</h2>
+            <p>Click the button below to connect your Discord account and unlock your access:</p>
+            <p style="text-align:center;margin:28px 0">
+                <a href="${link}" style="background:#5865F2;color:#fff;padding:14px 28px;border-radius:8px;text-decoration:none;font-weight:600">Connect Discord</a>
+            </p>
+            <p style="color:#666;font-size:13px">If the button doesn't work, copy and paste this link into your browser:<br>${link}</p>
+        </div>`;
+    const res = await fetch('https://api.sendgrid.com/v3/mail/send', {
+        method: 'POST',
+        headers: {
+            Authorization: `Bearer ${process.env.SENDGRID_API_KEY}`,
+            'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+            personalizations: [{ to: [{ email: toEmail }] }],
+            from: { email: process.env.FROM_EMAIL, name: 'FiddyBot' },
+            subject: 'Connect your Discord to unlock access',
+            content: [{ type: 'text/html', value: html }]
+        })
+    });
+    if (res.status >= 200 && res.status < 300) {
+        console.log(`Connect email sent to ${toEmail}`);
+    } else {
+        const txt = await res.text();
+        console.error(`SendGrid error ${res.status}:`, txt);
+    }
 }
 function htmlPage(title, body) {
     return `<!doctype html><html><head><meta charset="utf-8"><title>${title}</title>
@@ -606,3 +650,4 @@ app.listen(PORT, () => console.log(`Webhook server listening on port ${PORT}`));
 
 // ====== LOGIN ======
 client.login(process.env.DISCORD_BOT_TOKEN);
+
