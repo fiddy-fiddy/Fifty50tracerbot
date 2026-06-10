@@ -5,7 +5,7 @@
 //   STRIPE_SECRET_KEY, STRIPE_WEBHOOK_SECRET,
 //   PUBLIC_URL (e.g. https://fiddybot-production.up.railway.app),
 //   DATABASE_URL (Neon Postgres), PORT (Railway sets this)
-//   SENDGRID_API_KEY, FROM_EMAIL (for emailing the connect link after payment)
+//   BREVO_API_KEY, FROM_EMAIL (for emailing the connect link after payment)
 
 const { Client, GatewayIntentBits, Partials, PermissionFlagsBits, EmbedBuilder } = require('discord.js');
 const fs = require('fs');
@@ -35,8 +35,10 @@ async function initDb() {
         CREATE TABLE IF NOT EXISTS bot_checkout_sessions (
             session_id TEXT PRIMARY KEY,
             customer_id TEXT NOT NULL,
+            used BOOLEAN DEFAULT FALSE,
             created_at TIMESTAMPTZ DEFAULT NOW()
         );
+        ALTER TABLE bot_checkout_sessions ADD COLUMN IF NOT EXISTS used BOOLEAN DEFAULT FALSE;
     `);
     console.log('Database tables ready.');
 }
@@ -49,7 +51,17 @@ async function dbSaveCheckoutSession(sessionId, customerId) {
     );
 }
 async function dbGetCheckoutSession(sessionId) {
-    const r = await pool.query(`SELECT customer_id FROM bot_checkout_sessions WHERE session_id = $1`, [sessionId]);
+    const r = await pool.query(`SELECT customer_id, used FROM bot_checkout_sessions WHERE session_id = $1`, [sessionId]);
+    if (!r.rows[0]) return null;
+    return { customerId: r.rows[0].customer_id, used: r.rows[0].used };
+}
+// Atomically claim a link so it can only ever be used once. Returns customer_id if
+// this caller won the claim, or null if it was already used / doesn't exist.
+async function dbClaimCheckoutSession(sessionId) {
+    const r = await pool.query(
+        `UPDATE bot_checkout_sessions SET used = TRUE WHERE session_id = $1 AND used = FALSE RETURNING customer_id`,
+        [sessionId]
+    );
     return r.rows[0]?.customer_id || null;
 }
 
@@ -493,10 +505,10 @@ function publicUrl() {
     return (process.env.PUBLIC_URL || '').replace(/\/$/, '');
 }
 
-// Send the "Connect Discord" link by email via SendGrid
+// Send the "Connect Discord" link by email via Brevo (free, no credit card)
 async function sendConnectEmail(toEmail, sessionId) {
-    if (!process.env.SENDGRID_API_KEY || !process.env.FROM_EMAIL) {
-        console.log('SendGrid not configured (SENDGRID_API_KEY / FROM_EMAIL) — skipping email');
+    if (!process.env.BREVO_API_KEY || !process.env.FROM_EMAIL) {
+        console.log('Brevo not configured (BREVO_API_KEY / FROM_EMAIL) — skipping email');
         return;
     }
     const link = `${publicUrl()}/connect?session_id=${sessionId}`;
@@ -509,24 +521,25 @@ async function sendConnectEmail(toEmail, sessionId) {
             </p>
             <p style="color:#666;font-size:13px">If the button doesn't work, copy and paste this link into your browser:<br>${link}</p>
         </div>`;
-    const res = await fetch('https://api.sendgrid.com/v3/mail/send', {
+    const res = await fetch('https://api.brevo.com/v3/smtp/email', {
         method: 'POST',
         headers: {
-            Authorization: `Bearer ${process.env.SENDGRID_API_KEY}`,
-            'Content-Type': 'application/json'
+            'api-key': process.env.BREVO_API_KEY,
+            'Content-Type': 'application/json',
+            'Accept': 'application/json'
         },
         body: JSON.stringify({
-            personalizations: [{ to: [{ email: toEmail }] }],
-            from: { email: process.env.FROM_EMAIL, name: 'FiddyBot' },
+            sender: { email: process.env.FROM_EMAIL, name: '50fifty' },
+            to: [{ email: toEmail }],
             subject: 'Connect your Discord to unlock access',
-            content: [{ type: 'text/html', value: html }]
+            htmlContent: html
         })
     });
     if (res.status >= 200 && res.status < 300) {
         console.log(`Connect email sent to ${toEmail}`);
     } else {
         const txt = await res.text();
-        console.error(`SendGrid error ${res.status}:`, txt);
+        console.error(`Brevo error ${res.status}:`, txt);
     }
 }
 function htmlPage(title, body) {
@@ -547,11 +560,19 @@ a.btn:hover{background:#4752c4}
 app.get('/connect', async (req, res) => {
     const sessionId = req.query.session_id;
     if (!sessionId) {
-        return res.status(400).send(htmlPage('Error', `<h1 class="error">Missing session</h1><p>This link is invalid. Please use the link from your Stripe receipt.</p>`));
+        // No session id (e.g. plain redirect from Stripe) — point them to their email
+        return res.send(htmlPage('Payment received', `
+            <h1 class="success">Payment received!</h1>
+            <p>Check your email for your personal <strong>Connect Discord</strong> link to unlock your access. It should arrive within a minute.</p>
+            <p style="font-size:13px;color:#9aa3b2">Don't see it? Check your spam folder.</p>
+        `));
     }
-    const customerId = await dbGetCheckoutSession(sessionId);
-    if (!customerId) {
+    const row = await dbGetCheckoutSession(sessionId);
+    if (!row) {
         return res.status(404).send(htmlPage('Not found', `<h1 class="error">Payment not found yet</h1><p>Your payment is still processing. Please refresh this page in 30 seconds.</p>`));
+    }
+    if (row.used) {
+        return res.status(409).send(htmlPage('Already used', `<h1 class="error">This link has already been used</h1><p>This access link can only be used once and has already connected a Discord account. If this wasn't you, contact support.</p>`));
     }
     const redirectUri = encodeURIComponent(`${publicUrl()}/oauth/callback`);
     const clientId = process.env.DISCORD_CLIENT_ID;
@@ -570,9 +591,12 @@ app.get('/oauth/callback', async (req, res) => {
         return res.status(400).send(htmlPage('Error', `<h1 class="error">Missing code</h1><p>Something went wrong. Please try the connect link again.</p>`));
     }
     const sessionId = decodeURIComponent(state);
-    const customerId = await dbGetCheckoutSession(sessionId);
-    if (!customerId) {
+    const row = await dbGetCheckoutSession(sessionId);
+    if (!row) {
         return res.status(404).send(htmlPage('Error', `<h1 class="error">Session expired</h1><p>Please use the link from your Stripe receipt again.</p>`));
+    }
+    if (row.used) {
+        return res.status(409).send(htmlPage('Already used', `<h1 class="error">This link has already been used</h1><p>This access link can only be used once and has already connected a Discord account.</p>`));
     }
 
     try {
@@ -602,6 +626,12 @@ app.get('/oauth/callback', async (req, res) => {
         if (!user.id) {
             console.error('User fetch failed:', user);
             return res.status(500).send(htmlPage('Error', `<h1 class="error">Connection failed</h1><p>Could not read your Discord account.</p>`));
+        }
+
+        // Atomically claim the link so it can never be reused/shared
+        const customerId = await dbClaimCheckoutSession(sessionId);
+        if (!customerId) {
+            return res.status(409).send(htmlPage('Already used', `<h1 class="error">This link has already been used</h1><p>This access link can only be used once and has already connected a Discord account.</p>`));
         }
 
         // Add user to guild with PAID role (or update if already a member)
