@@ -21,6 +21,22 @@ const pool = new Pool({
     ssl: { rejectUnauthorized: false }
 });
 
+// Neon drops idle connections — don't let that crash the whole bot.
+pool.on('error', (err) => console.error('PG pool error (ignored, will reconnect):', err.message));
+// Last-resort safety net so one bad request/promise never kills the bot process.
+process.on('unhandledRejection', (err) => console.error('Unhandled rejection (ignored):', err));
+process.on('uncaughtException', (err) => console.error('Uncaught exception (ignored):', err));
+
+// Run a query, retrying once if the connection was dropped (Neon idle timeout).
+async function dbQuery(text, params) {
+    try {
+        return await pool.query(text, params);
+    } catch (err) {
+        console.error('DB query failed, retrying once:', err.message);
+        return await pool.query(text, params);
+    }
+}
+
 async function initDb() {
     await pool.query(`
         CREATE TABLE IF NOT EXISTS bot_subscribers (
@@ -44,21 +60,21 @@ async function initDb() {
 }
 
 async function dbSaveCheckoutSession(sessionId, customerId) {
-    await pool.query(
+    await dbQuery(
         `INSERT INTO bot_checkout_sessions (session_id, customer_id) VALUES ($1, $2)
          ON CONFLICT (session_id) DO UPDATE SET customer_id = EXCLUDED.customer_id`,
         [sessionId, customerId]
     );
 }
 async function dbGetCheckoutSession(sessionId) {
-    const r = await pool.query(`SELECT customer_id, used FROM bot_checkout_sessions WHERE session_id = $1`, [sessionId]);
+    const r = await dbQuery(`SELECT customer_id, used FROM bot_checkout_sessions WHERE session_id = $1`, [sessionId]);
     if (!r.rows[0]) return null;
     return { customerId: r.rows[0].customer_id, used: r.rows[0].used };
 }
 // Atomically claim a link so it can only ever be used once. Returns customer_id if
 // this caller won the claim, or null if it was already used / doesn't exist.
 async function dbClaimCheckoutSession(sessionId) {
-    const r = await pool.query(
+    const r = await dbQuery(
         `UPDATE bot_checkout_sessions SET used = TRUE WHERE session_id = $1 AND used = FALSE RETURNING customer_id`,
         [sessionId]
     );
@@ -66,32 +82,32 @@ async function dbClaimCheckoutSession(sessionId) {
 }
 
 async function dbSaveSubscriber(customerId, discordId, username) {
-    await pool.query(
+    await dbQuery(
         `INSERT INTO bot_subscribers (customer_id, discord_id, username) VALUES ($1, $2, $3)
          ON CONFLICT (customer_id) DO UPDATE SET discord_id = EXCLUDED.discord_id, username = EXCLUDED.username`,
         [customerId, discordId, username || null]
     );
 }
 async function dbGetSubscriber(customerId) {
-    const r = await pool.query(`SELECT discord_id FROM bot_subscribers WHERE customer_id = $1`, [customerId]);
+    const r = await dbQuery(`SELECT discord_id FROM bot_subscribers WHERE customer_id = $1`, [customerId]);
     return r.rows[0]?.discord_id || null;
 }
 async function dbDeleteSubscriber(customerId) {
-    await pool.query(`DELETE FROM bot_subscribers WHERE customer_id = $1`, [customerId]);
+    await dbQuery(`DELETE FROM bot_subscribers WHERE customer_id = $1`, [customerId]);
 }
 async function dbSavePending(usernameKey, customerId) {
-    await pool.query(
+    await dbQuery(
         `INSERT INTO bot_pending (username_key, customer_id) VALUES ($1, $2)
          ON CONFLICT (username_key) DO UPDATE SET customer_id = EXCLUDED.customer_id`,
         [usernameKey, customerId]
     );
 }
 async function dbGetPending(usernameKey) {
-    const r = await pool.query(`SELECT customer_id FROM bot_pending WHERE username_key = $1`, [usernameKey]);
+    const r = await dbQuery(`SELECT customer_id FROM bot_pending WHERE username_key = $1`, [usernameKey]);
     return r.rows[0]?.customer_id || null;
 }
 async function dbDeletePending(usernameKey) {
-    await pool.query(`DELETE FROM bot_pending WHERE username_key = $1`, [usernameKey]);
+    await dbQuery(`DELETE FROM bot_pending WHERE username_key = $1`, [usernameKey]);
 }
 
 const client = new Client({
@@ -567,22 +583,27 @@ app.get('/connect', async (req, res) => {
             <p style="font-size:13px;color:#9aa3b2">Don't see it? Check your spam folder.</p>
         `));
     }
-    const row = await dbGetCheckoutSession(sessionId);
-    if (!row) {
-        return res.status(404).send(htmlPage('Not found', `<h1 class="error">Payment not found yet</h1><p>Your payment is still processing. Please refresh this page in 30 seconds.</p>`));
+    try {
+        const row = await dbGetCheckoutSession(sessionId);
+        if (!row) {
+            return res.status(404).send(htmlPage('Not found', `<h1 class="error">Payment not found yet</h1><p>Your payment is still processing. Please refresh this page in 30 seconds.</p>`));
+        }
+        if (row.used) {
+            return res.status(409).send(htmlPage('Already used', `<h1 class="error">This link has already been used</h1><p>This access link can only be used once and has already connected a Discord account. If this wasn't you, contact support.</p>`));
+        }
+        const redirectUri = encodeURIComponent(`${publicUrl()}/oauth/callback`);
+        const clientId = process.env.DISCORD_CLIENT_ID;
+        const state = encodeURIComponent(sessionId);
+        const url = `https://discord.com/api/oauth2/authorize?client_id=${clientId}&redirect_uri=${redirectUri}&response_type=code&scope=identify%20guilds.join&state=${state}&prompt=consent`;
+        res.send(htmlPage('Connect Discord', `
+            <h1>Payment received!</h1>
+            <p>Click below to connect your Discord account and unlock your access.</p>
+            <a class="btn" href="${url}">Connect Discord</a>
+        `));
+    } catch (err) {
+        console.error('/connect error:', err.message);
+        res.status(500).send(htmlPage('Try again', `<h1 class="error">One moment</h1><p>We couldn't load your connect page just now. Please refresh this page in a few seconds.</p>`));
     }
-    if (row.used) {
-        return res.status(409).send(htmlPage('Already used', `<h1 class="error">This link has already been used</h1><p>This access link can only be used once and has already connected a Discord account. If this wasn't you, contact support.</p>`));
-    }
-    const redirectUri = encodeURIComponent(`${publicUrl()}/oauth/callback`);
-    const clientId = process.env.DISCORD_CLIENT_ID;
-    const state = encodeURIComponent(sessionId);
-    const url = `https://discord.com/api/oauth2/authorize?client_id=${clientId}&redirect_uri=${redirectUri}&response_type=code&scope=identify%20guilds.join&state=${state}&prompt=consent`;
-    res.send(htmlPage('Connect Discord', `
-        <h1>Payment received!</h1>
-        <p>Click below to connect your Discord account and unlock your access.</p>
-        <a class="btn" href="${url}">Connect Discord</a>
-    `));
 });
 
 app.get('/oauth/callback', async (req, res) => {
@@ -591,15 +612,16 @@ app.get('/oauth/callback', async (req, res) => {
         return res.status(400).send(htmlPage('Error', `<h1 class="error">Missing code</h1><p>Something went wrong. Please try the connect link again.</p>`));
     }
     const sessionId = decodeURIComponent(state);
-    const row = await dbGetCheckoutSession(sessionId);
-    if (!row) {
-        return res.status(404).send(htmlPage('Error', `<h1 class="error">Session expired</h1><p>Please use the link from your Stripe receipt again.</p>`));
-    }
-    if (row.used) {
-        return res.status(409).send(htmlPage('Already used', `<h1 class="error">This link has already been used</h1><p>This access link can only be used once and has already connected a Discord account.</p>`));
-    }
 
     try {
+        const row = await dbGetCheckoutSession(sessionId);
+        if (!row) {
+            return res.status(404).send(htmlPage('Error', `<h1 class="error">Session expired</h1><p>Please use the link from your Stripe receipt again.</p>`));
+        }
+        if (row.used) {
+            return res.status(409).send(htmlPage('Already used', `<h1 class="error">This link has already been used</h1><p>This access link can only be used once and has already connected a Discord account.</p>`));
+        }
+
         // Exchange code for access token
         const tokenRes = await fetch('https://discord.com/api/oauth2/token', {
             method: 'POST',
@@ -675,8 +697,8 @@ app.get('/oauth/callback', async (req, res) => {
 
 app.get('/', (_req, res) => res.send('FiddyBot is running!'));
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Webhook server listening on port ${PORT}`));
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, '0.0.0.0', () => console.log(`Webhook server listening on port ${PORT}`));
 
 // ====== LOGIN ======
 client.login(process.env.DISCORD_BOT_TOKEN);
