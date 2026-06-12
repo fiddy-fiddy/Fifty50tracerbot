@@ -174,9 +174,12 @@ client.once('ready', async () => {
     console.log(`${client.user.tag} is online!`);
     try { await initDb(); } catch (e) { console.error('DB init failed:', e); }
 
-    // Run sweep on startup, then every 6 hours
-    sweepUnpaidMembers();
-    setInterval(sweepUnpaidMembers, 6 * 60 * 60 * 1000);
+    // Auto-sweep DISABLED on purpose. It kicked EVERY member without the PAID role,
+    // including the owner's friends/staff and customers who had paid but not yet
+    // clicked their Discord connect link. Removal now happens only via Stripe
+    // webhooks (cancel / refund / dispute), which is precise and safe.
+    // sweepUnpaidMembers();
+    // setInterval(sweepUnpaidMembers, 6 * 60 * 60 * 1000);
 
     const data = [
         { name: 'follow', description: 'Follow a bettor', options: [{ name: 'target', type: 6, description: 'User to follow', required: true }] },
