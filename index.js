@@ -182,7 +182,7 @@ client.once('ready', async () => {
     // setInterval(sweepUnpaidMembers, 6 * 60 * 60 * 1000);
 
     // Admin-only commands are hidden from regular members via defaultMemberPermissions.
-    // Only /stats and /parlay are visible to everyone.
+    // Only /stats is visible to everyone.
     const ADMIN_ONLY = PermissionFlagsBits.ManageGuild;
     const data = [
         { name: 'follow', description: 'Follow a bettor', options: [{ name: 'target', type: 6, description: 'User to follow', required: true }], defaultMemberPermissions: ADMIN_ONLY },
@@ -194,7 +194,7 @@ client.once('ready', async () => {
         { name: 'resetleaderboard', description: 'Admin: reset the entire leaderboard', defaultMemberPermissions: ADMIN_ONLY },
         { name: 'verifywin', description: 'Admin: log a win for a user', options: [{ name: 'target', type: 6, description: 'User to verify', required: true }], defaultMemberPermissions: ADMIN_ONLY },
         { name: 'stats', description: 'Look up sports stats (members chat only)', options: [{ name: 'question', type: 3, description: 'e.g. LeBron James points this season', required: true }] },
-        { name: 'parlay', description: 'Calculate parlay odds & payout (wins channel only)', options: [{ name: 'odds', type: 3, description: 'Odds per leg, e.g. +150 -110 +200', required: true }, { name: 'stake', type: 10, description: 'Amount you are betting (optional)', required: false }] }
+        { name: 'parlay', description: 'Calculate parlay odds & payout (wins channel only)', options: [{ name: 'odds', type: 3, description: 'Odds per leg, e.g. +150 -110 +200', required: true }, { name: 'stake', type: 10, description: 'Amount you are betting (optional)', required: false }], defaultMemberPermissions: ADMIN_ONLY }
     ];
 
     try {
@@ -816,7 +816,7 @@ app.get('/oauth/callback', async (req, res) => {
     }
 });
 
-const BUILD_MARKER = 'cmd-perms-2026-06-13-3';
+const BUILD_MARKER = 'cmd-perms-2026-06-13-4';
 app.get('/', (_req, res) => {
     let betSlips = 'unknown';
     try {
