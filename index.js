@@ -181,15 +181,18 @@ client.once('ready', async () => {
     // sweepUnpaidMembers();
     // setInterval(sweepUnpaidMembers, 6 * 60 * 60 * 1000);
 
+    // Admin-only commands are hidden from regular members via defaultMemberPermissions.
+    // Only /stats and /parlay are visible to everyone.
+    const ADMIN_ONLY = PermissionFlagsBits.ManageGuild;
     const data = [
-        { name: 'follow', description: 'Follow a bettor', options: [{ name: 'target', type: 6, description: 'User to follow', required: true }] },
-        { name: 'unfollow', description: 'Stop following a bettor', options: [{ name: 'target', type: 6, description: 'User to unfollow', required: true }] },
-        { name: 'following', description: 'See who you are following' },
-        { name: 'feed', description: 'See recent slips from users you follow' },
-        { name: 'alerts', description: 'Turn DM alerts on or off', options: [{ name: 'state', type: 3, description: 'on or off', required: true }] },
-        { name: 'addwin', description: 'Add a win to the leaderboard', options: [{ name: 'name', type: 3, description: 'Bettor name', required: true }, { name: 'odds', type: 4, description: 'Win amount (+/- value)', required: true }] },
-        { name: 'resetleaderboard', description: 'Admin: reset the entire leaderboard' },
-        { name: 'verifywin', description: 'Admin: log a win for a user', options: [{ name: 'target', type: 6, description: 'User to verify', required: true }] },
+        { name: 'follow', description: 'Follow a bettor', options: [{ name: 'target', type: 6, description: 'User to follow', required: true }], defaultMemberPermissions: ADMIN_ONLY },
+        { name: 'unfollow', description: 'Stop following a bettor', options: [{ name: 'target', type: 6, description: 'User to unfollow', required: true }], defaultMemberPermissions: ADMIN_ONLY },
+        { name: 'following', description: 'See who you are following', defaultMemberPermissions: ADMIN_ONLY },
+        { name: 'feed', description: 'See recent slips from users you follow', defaultMemberPermissions: ADMIN_ONLY },
+        { name: 'alerts', description: 'Turn DM alerts on or off', options: [{ name: 'state', type: 3, description: 'on or off', required: true }], defaultMemberPermissions: ADMIN_ONLY },
+        { name: 'addwin', description: 'Add a win to the leaderboard', options: [{ name: 'name', type: 3, description: 'Bettor name', required: true }, { name: 'odds', type: 4, description: 'Win amount (+/- value)', required: true }], defaultMemberPermissions: ADMIN_ONLY },
+        { name: 'resetleaderboard', description: 'Admin: reset the entire leaderboard', defaultMemberPermissions: ADMIN_ONLY },
+        { name: 'verifywin', description: 'Admin: log a win for a user', options: [{ name: 'target', type: 6, description: 'User to verify', required: true }], defaultMemberPermissions: ADMIN_ONLY },
         { name: 'stats', description: 'Look up sports stats (members chat only)', options: [{ name: 'question', type: 3, description: 'e.g. LeBron James points this season', required: true }] },
         { name: 'parlay', description: 'Calculate parlay odds & payout (wins channel only)', options: [{ name: 'odds', type: 3, description: 'Odds per leg, e.g. +150 -110 +200', required: true }, { name: 'stake', type: 10, description: 'Amount you are betting (optional)', required: false }] }
     ];
@@ -813,7 +816,7 @@ app.get('/oauth/callback', async (req, res) => {
     }
 });
 
-const BUILD_MARKER = 'stats-parlay-2026-06-13-2';
+const BUILD_MARKER = 'cmd-perms-2026-06-13-3';
 app.get('/', (_req, res) => {
     let betSlips = 'unknown';
     try {
