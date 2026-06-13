@@ -189,6 +189,7 @@ const KALSHI_LEAGUES = [
     { key: 'mls',   name: 'MLS',                      series: 'KXMLSGAME' },
     { key: 'epl',   name: 'Premier League',           series: 'KXEPLGAME' },
     { key: 'ucl',   name: 'Champions League',         series: 'KXUCLGAME' },
+    { key: 'wc',    name: 'World Cup',                 series: 'KXWCGAME' },
     { key: 'atp',   name: 'ATP Tennis',               series: 'KXATPGAME' },
     { key: 'wta',   name: 'WTA Tennis',               series: 'KXWTAGAME' }
 ];
@@ -207,6 +208,46 @@ const KALSHI_ALIASES = {
     nhl: { ducks:'ana', bruins:'bos', sabres:'buf', flames:'cgy', hurricanes:'car', canes:'car', blackhawks:'chi', avalanche:'col', avs:'col', 'blue jackets':'cbj', stars:'dal', 'red wings':'det', oilers:'edm', panthers:'fla', kings:'lak', wild:'min', canadiens:'mtl', habs:'mtl', predators:'nsh', preds:'nsh', devils:'njd', islanders:'nyi', rangers:'nyr', senators:'ott', sens:'ott', flyers:'phi', penguins:'pit', pens:'pit', sharks:'sjs', kraken:'sea', blues:'stl', lightning:'tbl', bolts:'tbl', 'maple leafs':'tor', leafs:'tor', canucks:'van', 'golden knights':'vgk', knights:'vgk', capitals:'wsh', caps:'wsh', jets:'wpg', utah:'uta' },
     wnba: { dream:'atlanta', sky:'chicago', sun:'connecticut', wings:'dallas', fever:'indiana', aces:'las vegas', sparks:'los angeles', lynx:'minnesota', liberty:'new york', mercury:'phoenix', fire:'portland', tempo:'toronto', mystics:'washington', valkyries:'golden state' },
     nfl: { cardinals:'arizona', falcons:'atlanta', ravens:'baltimore', bills:'buffalo', panthers:'carolina', bears:'chicago', bengals:'cincinnati', browns:'cleveland', cowboys:'dallas', broncos:'denver', lions:'detroit', packers:'green bay', texans:'houston', colts:'indianapolis', jaguars:'jacksonville', jags:'jacksonville', chiefs:'kansas city', raiders:'las vegas', chargers:'los angeles c', rams:'los angeles r', dolphins:'miami', vikings:'minnesota', vikes:'minnesota', patriots:'new england', pats:'new england', saints:'new orleans', giants:'new york g', jets:'new york j', eagles:'philadelphia', steelers:'pittsburgh', niners:'san francisco', '49ers':'san francisco', seahawks:'seattle', buccaneers:'tampa bay', bucs:'tampa bay', titans:'tennessee', commanders:'washington' }
+};
+
+// Player props on Kalshi, grouped by league. Each entry is one stat type:
+//  • type 'threshold' = many markets per player (e.g. "25+ / 30+ points"); we chart the
+//    line closest to a coin-flip (the "main line", like a sportsbook's over/under number).
+//  • type 'binary'    = one yes/no market per player (e.g. "to score or assist").
+// The FIRST stat listed for a league is the default when a member types only a name.
+// `stat` values must match the /linehistory "stat" menu choices below.
+const PLAYER_PROPS = {
+    nba: [
+        { stat: 'points',   series: 'KXNBAPTS', type: 'threshold', word: 'points' },
+        { stat: 'rebounds', series: 'KXNBAREB', type: 'threshold', word: 'rebounds' },
+        { stat: 'assists',  series: 'KXNBAAST', type: 'threshold', word: 'assists' },
+        { stat: 'threes',   series: 'KXNBA3PT', type: 'threshold', word: 'threes' },
+        { stat: 'steals',   series: 'KXNBASTL', type: 'threshold', word: 'steals' },
+        { stat: 'blocks',   series: 'KXNBABLK', type: 'threshold', word: 'blocks' }
+    ],
+    wnba: [
+        { stat: 'points',   series: 'KXWNBAPTS', type: 'threshold', word: 'points' },
+        { stat: 'rebounds', series: 'KXWNBAREB', type: 'threshold', word: 'rebounds' },
+        { stat: 'assists',  series: 'KXWNBAAST', type: 'threshold', word: 'assists' },
+        { stat: 'threes',   series: 'KXWNBA3PT', type: 'threshold', word: 'threes' }
+    ],
+    wc: [
+        { stat: 'soa',   series: 'KXWCSOA',         type: 'binary',    word: 'to score or assist' },
+        { stat: 'goal',  series: 'KXWCPLAYERGOALS', type: 'binary',    word: 'to score' },
+        { stat: 'shots', series: 'KXWCSHOT',        type: 'threshold', word: 'shots' }
+    ],
+    ucl: [
+        { stat: 'soa',   series: 'KXUCLSOA',  type: 'binary',    word: 'to score or assist' },
+        { stat: 'goal',  series: 'KXUCLGOAL', type: 'binary',    word: 'to score' },
+        { stat: 'shots', series: 'KXUCLSHOT', type: 'threshold', word: 'shots' }
+    ],
+    epl: [
+        { stat: 'soa',  series: 'KXEPLSOA',     type: 'binary', word: 'to score or assist' },
+        { stat: 'goal', series: 'KXEPLANYGOAL', type: 'binary', word: 'to score' }
+    ],
+    nhl: [
+        { stat: 'goal', series: 'KXNHLANYGOAL', type: 'binary', word: 'to score' }
+    ]
 };
 
 // Convert an implied win probability (0..1) to an American moneyline string (e.g. -150, +130).
@@ -308,6 +349,162 @@ async function findKalshiMarket(query, leagueKey) {
     return overallBest;
 }
 
+// ----- PLAYER PROPS -----
+// Player markets put the person's name in yes_sub_title, e.g. "Victor Wembanyama: 30+"
+// (threshold props) or just "Lamine Yamal" (yes/no props). Pull the name part out.
+function extractPlayerName(yesSub) {
+    const s = (yesSub || '').trim();
+    const i = s.indexOf(':');
+    return (i >= 0 ? s.slice(0, i) : s).trim();
+}
+
+// Score how well a typed name matches a player (0 = none, ~100 = exact). Members usually
+// type a last name ("salah", "wembanyama") but full names work too.
+function playerMatchScore(query, name) {
+    const q = normTeam(query);
+    const n = normTeam(name);
+    if (!q || !n) return 0;
+    if (n === q) return 100;
+    const qt = q.split(' ').filter(Boolean);
+    const nt = n.split(' ').filter(Boolean);
+    const last = nt[nt.length - 1];
+    if (qt.length >= 2 && qt.every(t => nt.includes(t))) return 92; // all typed words present
+    if (n.includes(q)) return qt.length >= 2 ? 90 : 78;             // typed text sits inside the name
+    if (qt.length === 1) {
+        if (last === q) return 85;                                  // last-name match
+        if (nt.includes(q)) return 70;                             // first/middle name match
+        if (q.length >= 4 && last.startsWith(q)) return 60;        // partial last name
+    }
+    return 0;
+}
+
+// Best current price (0..1) for a market, from its live quote (traded last, else bid/ask mid).
+function currentMarketProb(m) {
+    return candlePrice({
+        price: { close_dollars: m.last_price_dollars },
+        yes_ask: { close_dollars: m.yes_ask_dollars },
+        yes_bid: { close_dollars: m.yes_bid_dollars }
+    });
+}
+
+// Human label for the line we're charting, e.g. "30+ points" or "to score or assist".
+function buildLineLabel(market, prop) {
+    const sub = market.yes_sub_title || '';
+    const i = sub.indexOf(':');
+    if (i >= 0) {
+        const thr = sub.slice(i + 1).trim(); // "30+"
+        return prop.word ? `${thr} ${prop.word}` : thr;
+    }
+    return prop.word || 'prop';
+}
+
+// Find a player's prop market. Searches the chosen stat (or each league's default stat),
+// matches the player by name, and for threshold props picks the line closest to 50/50
+// (the main line). Bounded: one request per stat series, stops at the first match.
+// Returns { leagueName, seriesTicker, event, market, player, prop } or { ambiguous, names } or null.
+async function findKalshiPlayer(query, leagueKey, statKey) {
+    const leagueKeys = leagueKey
+        ? (PLAYER_PROPS[leagueKey] ? [leagueKey] : [])
+        : Object.keys(PLAYER_PROPS);
+    const searches = [];
+    for (const lk of leagueKeys) {
+        const props = PLAYER_PROPS[lk] || [];
+        const chosen = statKey ? props.filter(p => p.stat === statKey) : (props[0] ? [props[0]] : []);
+        if (chosen.length === 0) continue;
+        const lgName = (KALSHI_LEAGUES.find(l => l.key === lk) || {}).name || lk.toUpperCase();
+        for (const prop of chosen) searches.push({ leagueName: lgName, prop });
+    }
+
+    let ambiguousNames = null;
+    for (const s of searches) {
+        let data;
+        try { data = await kalshiGet(`/events?series_ticker=${s.prop.series}&status=open&with_nested_markets=true&limit=80`); }
+        catch (e) { if (String(e.message).includes('rate')) throw e; continue; }
+        const events = (data && data.events) || [];
+
+        // Group matching markets by player (within an event), keeping their best score.
+        const byPlayer = new Map();
+        for (const ev of events) {
+            for (const m of (ev.markets || [])) {
+                if (m.status && m.status !== 'active') continue;
+                const name = extractPlayerName(m.yes_sub_title);
+                const score = playerMatchScore(query, name);
+                if (score <= 0) continue;
+                const key = ev.event_ticker + '|' + normTeam(name);
+                const cur = byPlayer.get(key) || { name, score: 0, event: ev, markets: [] };
+                cur.score = Math.max(cur.score, score);
+                cur.markets.push(m);
+                byPlayer.set(key, cur);
+            }
+        }
+        if (byPlayer.size === 0) continue;
+
+        const arr = [...byPlayer.values()].sort((a, b) => b.score - a.score);
+        const top = arr[0];
+        const tiedNames = [...new Set(arr.filter(x => x.score === top.score).map(x => x.name))];
+        if (tiedNames.length > 1 && top.score < 95) {
+            if (!ambiguousNames) ambiguousNames = tiedNames.slice(0, 5);
+            continue; // keep looking in case another stat series has a clean match
+        }
+
+        // Pick the main line: the player's market whose live price is closest to 50/50.
+        const priced = top.markets.map(m => ({ m, p: currentMarketProb(m) })).filter(x => x.p != null);
+        let mainMarket;
+        if (priced.length) {
+            priced.sort((a, b) => Math.abs(a.p - 0.5) - Math.abs(b.p - 0.5));
+            mainMarket = priced[0].m;
+        } else {
+            mainMarket = top.markets[0]; // unpriced — still return so we can show "no line yet"
+        }
+        return {
+            leagueName: s.leagueName,
+            seriesTicker: s.prop.series,
+            event: top.event,
+            market: mainMarket,
+            player: top.name,
+            prop: { ...s.prop, lineLabel: buildLineLabel(mainMarket, s.prop) }
+        };
+    }
+    if (ambiguousNames) return { ambiguous: true, names: ambiguousNames };
+    return null;
+}
+
+// Shape a team match into the common "view" the chart/embed code below reads.
+function teamView(match) {
+    const subject = match.market.yes_sub_title || 'This team';
+    return {
+        seriesTicker: match.league.series,
+        leagueName: match.league.name,
+        event: match.event,
+        market: match.market,
+        nowLabel: subject,
+        lineNote: 'to win',
+        chartLabel: `${subject} win chance (%)`,
+        chartTitle: `${match.event.title} — ${subject} win odds`,
+        embedTitle: `📈 Line Movement — ${match.event.title}`,
+        line1: `**${subject}** to win · ${match.league.name}`,
+        axis: 'Win chance (%)'
+    };
+}
+
+// Shape a player match into the common "view".
+function playerView(pm) {
+    const line = pm.prop.lineLabel;
+    return {
+        seriesTicker: pm.seriesTicker,
+        leagueName: pm.leagueName,
+        event: pm.event,
+        market: pm.market,
+        nowLabel: pm.player,
+        lineNote: line,
+        chartLabel: `${pm.player} ${line} (%)`,
+        chartTitle: `${pm.event.title} — ${pm.player}: ${line}`,
+        embedTitle: `📈 Line Movement — ${pm.player}`,
+        line1: `**${pm.player}** — ${line} · ${pm.leagueName} · ${pm.event.title}`,
+        axis: 'Chance (%)'
+    };
+}
+
 // Pull ~7 days of hourly price history for one market and return chart-ready points.
 async function fetchKalshiHistory(seriesTicker, marketTicker) {
     const now = Math.floor(Date.now() / 1000);
@@ -372,8 +569,8 @@ client.once('ready', async () => {
         { name: 'resetleaderboard', description: 'Admin: reset the entire leaderboard', defaultMemberPermissions: ADMIN_ONLY },
         { name: 'verifywin', description: 'Admin: log a win for a user', options: [{ name: 'target', type: 6, description: 'User to verify', required: true }], defaultMemberPermissions: ADMIN_ONLY },
         { name: 'stats', description: 'Look up sports stats (members chat only)', options: [{ name: 'question', type: 3, description: 'e.g. LeBron James points this season', required: true }] },
-        { name: 'linehistory', description: 'Show how a team\'s win odds have moved (members chat only)', options: [
-            { name: 'team', type: 3, description: 'Team or player, e.g. Yankees, Lakers, Real Madrid', required: true },
+        { name: 'linehistory', description: 'Show how a team or player\'s odds have moved (members chat only)', options: [
+            { name: 'team', type: 3, description: 'Team OR player name — e.g. Lakers, Wembanyama, Salah', required: true },
             { name: 'league', type: 3, description: 'Optional: narrow the search to one league', required: false, choices: [
                 { name: 'MLB', value: 'mlb' },
                 { name: 'NBA', value: 'nba' },
@@ -385,8 +582,20 @@ client.once('ready', async () => {
                 { name: 'MLS', value: 'mls' },
                 { name: 'Premier League', value: 'epl' },
                 { name: 'Champions League', value: 'ucl' },
+                { name: 'World Cup', value: 'wc' },
                 { name: 'ATP Tennis', value: 'atp' },
                 { name: 'WTA Tennis', value: 'wta' }
+            ] },
+            { name: 'stat', type: 3, description: 'For players: which line to chart (default: points / score-or-assist)', required: false, choices: [
+                { name: 'Points', value: 'points' },
+                { name: 'Rebounds', value: 'rebounds' },
+                { name: 'Assists', value: 'assists' },
+                { name: '3-Pointers', value: 'threes' },
+                { name: 'Steals', value: 'steals' },
+                { name: 'Blocks', value: 'blocks' },
+                { name: 'Score or Assist (soccer)', value: 'soa' },
+                { name: 'Goal (soccer/hockey)', value: 'goal' },
+                { name: 'Shots (soccer)', value: 'shots' }
             ] }
         ] },
         { name: 'parlay', description: 'Calculate parlay odds & payout (wins channel only)', options: [{ name: 'odds', type: 3, description: 'Odds per leg, e.g. +150 -110 +200', required: true }, { name: 'stake', type: 10, description: 'Amount you are betting (optional)', required: false }], defaultMemberPermissions: ADMIN_ONLY }
@@ -679,34 +888,63 @@ client.on('interactionCreate', async interaction => {
         }
         const teamQuery = options.getString('team');
         const leagueKey = options.getString('league') || null;
+        const statKey = options.getString('stat') || null;
         await interaction.deferReply();
         try {
-            // 1) Find the current/upcoming game market for this team on Kalshi.
-            const match = await findKalshiMarket(teamQuery, leagueKey);
-            if (!match) {
+            // Work out WHAT to chart:
+            //  • a stat was picked  -> look up that player prop directly
+            //  • otherwise try the team game first; if it's a confident match, use it
+            //  • a weak / no team match -> also try player props and keep whichever wins
+            let view = null;
+            let ambiguous = null;
+
+            if (statKey) {
+                const pm = await findKalshiPlayer(teamQuery, leagueKey, statKey);
+                if (pm && pm.ambiguous) ambiguous = pm.names;
+                else if (pm) view = playerView(pm);
+            } else {
+                const teamMatch = await findKalshiMarket(teamQuery, leagueKey);
+                if (teamMatch && teamMatch.score >= 90) {
+                    view = teamView(teamMatch);
+                } else {
+                    let pm = null;
+                    try { pm = await findKalshiPlayer(teamQuery, leagueKey, null); }
+                    catch (e) { if (String(e.message).includes('rate')) throw e; }
+                    if (pm && pm.ambiguous) ambiguous = pm.names;
+                    else if (pm) view = playerView(pm);
+                    else if (teamMatch) view = teamView(teamMatch); // weak team match beats nothing
+                }
+            }
+
+            if (ambiguous) {
                 return interaction.editReply(
-                    `I couldn't find a current game for **${teamQuery}**.\n` +
-                    `• Try the team name or city — e.g. \`Yankees\`, \`Lakers\`, \`Real Madrid\`.\n` +
-                    `• That league may be off-season, or the game isn't listed yet (games show up a few days before they start).\n` +
+                    `I found a few players matching **${teamQuery}**: ${ambiguous.map(n => `**${n}**`).join(', ')}.\n` +
+                    `Type the full name (first and last) and I'll pull that one.`
+                );
+            }
+            if (!view) {
+                return interaction.editReply(
+                    `I couldn't find a current line for **${teamQuery}**.\n` +
+                    `• For a team, try the name or city — e.g. \`Yankees\`, \`Lakers\`, \`Real Madrid\`.\n` +
+                    `• For a player, try their name — e.g. \`Wembanyama\`, \`Salah\` — and pick the **stat** (points, goal, etc.).\n` +
+                    `• That league may be off-season, or the game/player isn't listed yet (lines show up a few days before tip-off/kickoff).\n` +
                     `• Tip: pick a **league** in the command to search faster.`
                 );
             }
-            const { league, event, market } = match;
-            const teamName = market.yes_sub_title || teamQuery;
 
-            // 2) Pull this market's price history (= win-chance over time).
-            const points = await fetchKalshiHistory(league.series, market.ticker);
+            // Pull this market's price history (= the chance over time).
+            const points = await fetchKalshiHistory(view.seriesTicker, view.market.ticker);
             if (points.length === 0) {
-                const nowP = candlePrice({ price: {}, yes_ask: { close_dollars: market.yes_ask_dollars }, yes_bid: { close_dollars: market.yes_bid_dollars } });
+                const nowP = currentMarketProb(view.market);
                 const nowStr = nowP != null ? `**${Math.round(nowP * 100)}%** (moneyline ${probToMoneyline(nowP)})` : 'not priced yet';
                 return interaction.editReply(
-                    `Found **${event.title}** (${league.name}) but there's no price history yet.\n` +
-                    `Current win chance for **${teamName}**: ${nowStr}.\n` +
+                    `Found **${view.event.title}** (${view.leagueName}) but there's no price history yet.\n` +
+                    `Current chance for **${view.nowLabel}** ${view.lineNote}: ${nowStr}.\n` +
                     `Check back closer to game time and the movement line will fill in.`
                 );
             }
 
-            // 3) Keep the chart readable if there are lots of hourly readings.
+            // Keep the chart readable if there are lots of hourly readings.
             let plot = points;
             if (plot.length > 60) {
                 const step = Math.ceil(plot.length / 60);
@@ -722,7 +960,7 @@ client.on('interactionCreate', async interaction => {
                 data: {
                     labels,
                     datasets: [{
-                        label: `${teamName} win chance (%)`,
+                        label: view.chartLabel,
                         data: values,
                         fill: false,
                         borderColor: '#00AE86',
@@ -732,9 +970,9 @@ client.on('interactionCreate', async interaction => {
                     }]
                 },
                 options: {
-                    title: { display: true, text: `${event.title} — ${teamName} win odds` },
+                    title: { display: true, text: view.chartTitle },
                     legend: { display: false },
-                    scales: { yAxes: [{ ticks: { suggestedMin: 0, suggestedMax: 100 }, scaleLabel: { display: true, labelString: 'Win chance (%)' } }] }
+                    scales: { yAxes: [{ ticks: { suggestedMin: 0, suggestedMax: 100 }, scaleLabel: { display: true, labelString: view.axis } }] }
                 }
             };
 
@@ -744,14 +982,14 @@ client.on('interactionCreate', async interaction => {
 
             const embed = new EmbedBuilder()
                 .setColor(0x00AE86)
-                .setTitle(`📈 Line Movement — ${event.title}`)
+                .setTitle(view.embedTitle)
                 .setDescription(
-                    `**${teamName}** to win · ${league.name}\n` +
+                    `${view.line1}\n` +
                     `Now: **${Math.round(latest * 100)}%**  (moneyline **${probToMoneyline(latest)}**)\n` +
                     `Earlier this week: about **${Math.round(first * 100)}%** (${probToMoneyline(first)})\n` +
                     `${points.length} hourly reading${points.length === 1 ? '' : 's'}`
                 )
-                .setFooter({ text: 'Live win odds via Kalshi · refreshed each time you run the command' });
+                .setFooter({ text: 'Live odds via Kalshi · refreshed each time you run the command' });
             if (imageUrl) embed.setImage(imageUrl);
             await interaction.editReply({ embeds: [embed] });
         } catch (e) {
@@ -1105,7 +1343,7 @@ app.get('/oauth/callback', async (req, res) => {
     }
 });
 
-const BUILD_MARKER = 'linehistory-kalshi-2026-06-13-1';
+const BUILD_MARKER = 'linehistory-players-2026-06-13-1';
 app.get('/', (_req, res) => {
     let betSlips = 'unknown';
     try {
@@ -1133,4 +1371,3 @@ app.listen(PORT, '0.0.0.0', () => console.log(`Webhook server listening on port 
 
 // ====== LOGIN ======
 client.login(process.env.DISCORD_BOT_TOKEN);
-
