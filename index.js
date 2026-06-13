@@ -189,7 +189,9 @@ client.once('ready', async () => {
         { name: 'alerts', description: 'Turn DM alerts on or off', options: [{ name: 'state', type: 3, description: 'on or off', required: true }] },
         { name: 'addwin', description: 'Add a win to the leaderboard', options: [{ name: 'name', type: 3, description: 'Bettor name', required: true }, { name: 'odds', type: 4, description: 'Win amount (+/- value)', required: true }] },
         { name: 'resetleaderboard', description: 'Admin: reset the entire leaderboard' },
-        { name: 'verifywin', description: 'Admin: log a win for a user', options: [{ name: 'target', type: 6, description: 'User to verify', required: true }] }
+        { name: 'verifywin', description: 'Admin: log a win for a user', options: [{ name: 'target', type: 6, description: 'User to verify', required: true }] },
+        { name: 'stats', description: 'Look up sports stats (members chat only)', options: [{ name: 'question', type: 3, description: 'e.g. LeBron James points this season', required: true }] },
+        { name: 'parlay', description: 'Calculate parlay odds & payout (wins channel only)', options: [{ name: 'odds', type: 3, description: 'Odds per leg, e.g. +150 -110 +200', required: true }, { name: 'stake', type: 10, description: 'Amount you are betting (optional)', required: false }] }
     ];
 
     try {
@@ -305,6 +307,18 @@ async function updateLeaderboardEmbed(guild) {
     lbChannel.send({ embeds: [embed] });
 }
 
+// Decode common HTML entities found in StatMuse meta tags
+function decodeEntities(str) {
+    return String(str)
+        .replace(/&amp;/g, '&')
+        .replace(/&lt;/g, '<')
+        .replace(/&gt;/g, '>')
+        .replace(/&quot;/g, '"')
+        .replace(/&#0?39;/g, "'")
+        .replace(/&#x27;/gi, "'")
+        .replace(/&#(\d+);/g, (_, n) => String.fromCharCode(parseInt(n, 10)));
+}
+
 // ====== INTERACTION HANDLER ======
 client.on('interactionCreate', async interaction => {
     if (!interaction.isChatInputCommand()) return;
@@ -377,6 +391,84 @@ client.on('interactionCreate', async interaction => {
         saveLeaderboard();
         updateLeaderboardEmbed(interaction.guild);
         await interaction.reply('Leaderboard reset.');
+    }
+
+    // ===== /stats — StatMuse lookup, MEMBERS CHAT ONLY, public =====
+    if (commandName === 'stats') {
+        const norm = (interaction.channel?.name || '').toLowerCase().replace(/[^a-z]/g, '');
+        if (!norm.includes('memberschat')) {
+            return interaction.reply({ content: '📊 The `/stats` command can only be used in the members chat.', ephemeral: true });
+        }
+        const question = options.getString('question');
+        await interaction.deferReply();
+        try {
+            const url = `https://www.statmuse.com/ask?q=${encodeURIComponent(question)}`;
+            const resp = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36' } });
+            const html = await resp.text();
+            const dm = html.match(/<meta property="og:description" content="([^"]*)"/i);
+            const im = html.match(/<meta property="og:image" content="([^"]*)"/i);
+            const answer = dm ? decodeEntities(dm[1]) : null;
+            const image = im ? decodeEntities(im[1]) : null;
+            // StatMuse returns a generic marketing blurb + banner when it has no real answer
+            const noResult = !answer || /instant answers to your/i.test(answer) || (image && image.includes('sm-meta-banner'));
+            if (noResult) {
+                return interaction.editReply(`Couldn't find stats for **${question}** — try rephrasing, e.g. \`/stats LeBron James points this season\`.`);
+            }
+            const embed = new EmbedBuilder()
+                .setColor(0x00AE86)
+                .setTitle(`📊 ${answer}`.slice(0, 256))
+                .setURL(url)
+                .setFooter({ text: 'Stats via StatMuse — tap the title for the full breakdown' });
+            if (image) embed.setImage(image);
+            await interaction.editReply({ content: `**${question}**`, embeds: [embed] });
+        } catch (e) {
+            console.error('stats command error:', e);
+            await interaction.editReply('Something went wrong fetching stats. Please try again in a moment.');
+        }
+    }
+
+    // ===== /parlay — odds & payout calculator, WINS CHANNEL ONLY =====
+    if (commandName === 'parlay') {
+        const norm = (interaction.channel?.name || '').toLowerCase().replace(/[^a-z]/g, '');
+        if (!norm.includes('wins')) {
+            return interaction.reply({ content: '🧮 The `/parlay` command can only be used in the wins channel.', ephemeral: true });
+        }
+        const oddsStr = options.getString('odds');
+        const stake = options.getNumber('stake');
+        const tokens = oddsStr.split(/[\s,]+/).filter(Boolean);
+        const legs = [];
+        for (const t of tokens) {
+            if (!/^[+-]?\d+$/.test(t) || parseInt(t, 10) === 0) {
+                return interaction.reply({ content: `⚠️ "${t}" isn't valid odds. Use American odds like \`+150 -110 +200\`.`, ephemeral: true });
+            }
+            legs.push(parseInt(t, 10));
+        }
+        if (legs.length < 2) {
+            return interaction.reply({ content: '🧮 A parlay needs at least 2 legs. Example: `/parlay odds: +150 -110 +200`.', ephemeral: true });
+        }
+        const toDecimal = (a) => a > 0 ? (a / 100) + 1 : (100 / Math.abs(a)) + 1;
+        let combinedDec = 1;
+        for (const a of legs) combinedDec *= toDecimal(a);
+        const americanNum = combinedDec >= 2 ? (combinedDec - 1) * 100 : -100 / (combinedDec - 1);
+        const americanStr = (americanNum > 0 ? '+' : '') + Math.round(americanNum);
+        const legsStr = legs.map(a => (a > 0 ? '+' : '') + a).join('  ');
+
+        const embed = new EmbedBuilder()
+            .setColor(0xF5A623)
+            .setTitle('🧮 Parlay Calculator')
+            .addFields(
+                { name: 'Legs', value: '`' + legsStr + '`' },
+                { name: 'Combined Odds', value: `**${americanStr}**  _(×${combinedDec.toFixed(2)})_` }
+            );
+        if (stake != null && !isNaN(stake) && stake > 0) {
+            const payout = stake * combinedDec;
+            const profit = payout - stake;
+            embed.addFields({ name: 'Payout', value: `Stake **$${stake.toFixed(2)}** → **$${payout.toFixed(2)}**  (profit **$${profit.toFixed(2)}**)` });
+        } else {
+            embed.addFields({ name: 'Payout', value: 'Add a `stake` amount to also see the dollar payout.' });
+        }
+        embed.setFooter({ text: `${legs.length}-leg parlay` });
+        await interaction.reply({ embeds: [embed] });
     }
 });
 
@@ -721,7 +813,7 @@ app.get('/oauth/callback', async (req, res) => {
     }
 });
 
-const BUILD_MARKER = 'betslips-enforce-2026-06-13-1';
+const BUILD_MARKER = 'stats-parlay-2026-06-13-2';
 app.get('/', (_req, res) => {
     let betSlips = 'unknown';
     try {
