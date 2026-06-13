@@ -169,6 +169,184 @@ async function sweepUnpaidMembers() {
     }
 }
 
+// ====== LINE HISTORY (Kalshi) — live win-odds movement, pulled on demand ======
+// Kalshi lists a market for each game ("will TEAM win?"). The price IS the crowd's
+// implied win chance (0.46 = 46%). Reading prices + price history is PUBLIC — no API
+// key, no account, no setup. We fetch it live when someone runs /linehistory, so there
+// is nothing to poll, store, or pay for.
+const KALSHI_BASE = 'https://api.elections.kalshi.com/trade-api/v2';
+
+// Leagues we search, in priority order (we stop at the first confident team match).
+// Off-season leagues simply return nothing, so it is safe to keep them all listed.
+const KALSHI_LEAGUES = [
+    { key: 'mlb',   name: 'MLB',                      series: 'KXMLBGAME' },
+    { key: 'nba',   name: 'NBA',                      series: 'KXNBAGAME' },
+    { key: 'nhl',   name: 'NHL',                      series: 'KXNHLGAME' },
+    { key: 'wnba',  name: 'WNBA',                     series: 'KXWNBAGAME' },
+    { key: 'nfl',   name: 'NFL',                      series: 'KXNFLGAME' },
+    { key: 'ncaaf', name: 'College Football',         series: 'KXNCAAFGAME' },
+    { key: 'ncaab', name: "Men's College Basketball", series: 'KXNCAAMBGAME' },
+    { key: 'mls',   name: 'MLS',                      series: 'KXMLSGAME' },
+    { key: 'epl',   name: 'Premier League',           series: 'KXEPLGAME' },
+    { key: 'ucl',   name: 'Champions League',         series: 'KXUCLGAME' },
+    { key: 'atp',   name: 'ATP Tennis',               series: 'KXATPGAME' },
+    { key: 'wta',   name: 'WTA Tennis',               series: 'KXWTAGAME' }
+];
+
+// Turn any text into a simple comparable form: lowercase, letters/numbers/spaces only.
+const normTeam = (s) => (s || '').toLowerCase().replace(/[^a-z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim();
+
+// Common nicknames -> how Kalshi labels that team. Kalshi uses the city, plus a short
+// tag when two teams share a city ("Chicago C" = Cubs, "Chicago WS" = White Sox;
+// "New York Y" = Yankees, "New York M" = Mets). For some leagues it uses the team
+// abbreviation, so a few maps point to that instead. This lets members type "Yankees"
+// or "Dodgers". Soccer/tennis/college match fine on city or name, so they need no list.
+const KALSHI_ALIASES = {
+    mlb: { diamondbacks:'arizona', dbacks:'arizona', braves:'atlanta', orioles:'baltimore', 'red sox':'boston', redsox:'boston', cubs:'chicago c', 'white sox':'chicago ws', whitesox:'chicago ws', reds:'cincinnati', guardians:'cleveland', indians:'cleveland', rockies:'colorado', tigers:'detroit', astros:'houston', royals:'kansas city', angels:'los angeles a', dodgers:'los angeles d', marlins:'miami', brewers:'milwaukee', twins:'minnesota', mets:'new york m', yankees:'new york y', phillies:'philadelphia', pirates:'pittsburgh', padres:'san diego', giants:'san francisco', mariners:'seattle', cardinals:'st louis', cards:'st louis', rays:'tampa bay', rangers:'texas', 'blue jays':'toronto', bluejays:'toronto', jays:'toronto', nationals:'washington', nats:'washington', athletics:'a s', as:'a s', oakland:'a s', sacramento:'a s' },
+    nba: { hawks:'atlanta', celtics:'boston', nets:'brooklyn', hornets:'charlotte', bulls:'chicago', cavaliers:'cleveland', cavs:'cleveland', mavericks:'dallas', mavs:'dallas', nuggets:'denver', pistons:'detroit', warriors:'golden state', rockets:'houston', pacers:'indiana', clippers:'los angeles c', lakers:'los angeles l', grizzlies:'memphis', heat:'miami', bucks:'milwaukee', timberwolves:'minnesota', wolves:'minnesota', pelicans:'new orleans', knicks:'new york', thunder:'oklahoma city', magic:'orlando', sixers:'philadelphia', '76ers':'philadelphia', suns:'phoenix', 'trail blazers':'portland', blazers:'portland', kings:'sacramento', spurs:'san antonio', raptors:'toronto', jazz:'utah', wizards:'washington' },
+    nhl: { ducks:'ana', bruins:'bos', sabres:'buf', flames:'cgy', hurricanes:'car', canes:'car', blackhawks:'chi', avalanche:'col', avs:'col', 'blue jackets':'cbj', stars:'dal', 'red wings':'det', oilers:'edm', panthers:'fla', kings:'lak', wild:'min', canadiens:'mtl', habs:'mtl', predators:'nsh', preds:'nsh', devils:'njd', islanders:'nyi', rangers:'nyr', senators:'ott', sens:'ott', flyers:'phi', penguins:'pit', pens:'pit', sharks:'sjs', kraken:'sea', blues:'stl', lightning:'tbl', bolts:'tbl', 'maple leafs':'tor', leafs:'tor', canucks:'van', 'golden knights':'vgk', knights:'vgk', capitals:'wsh', caps:'wsh', jets:'wpg', utah:'uta' },
+    wnba: { dream:'atlanta', sky:'chicago', sun:'connecticut', wings:'dallas', fever:'indiana', aces:'las vegas', sparks:'los angeles', lynx:'minnesota', liberty:'new york', mercury:'phoenix', fire:'portland', tempo:'toronto', mystics:'washington', valkyries:'golden state' },
+    nfl: { cardinals:'arizona', falcons:'atlanta', ravens:'baltimore', bills:'buffalo', panthers:'carolina', bears:'chicago', bengals:'cincinnati', browns:'cleveland', cowboys:'dallas', broncos:'denver', lions:'detroit', packers:'green bay', texans:'houston', colts:'indianapolis', jaguars:'jacksonville', jags:'jacksonville', chiefs:'kansas city', raiders:'las vegas', chargers:'los angeles c', rams:'los angeles r', dolphins:'miami', vikings:'minnesota', vikes:'minnesota', patriots:'new england', pats:'new england', saints:'new orleans', giants:'new york g', jets:'new york j', eagles:'philadelphia', steelers:'pittsburgh', niners:'san francisco', '49ers':'san francisco', seahawks:'seattle', buccaneers:'tampa bay', bucs:'tampa bay', titans:'tennessee', commanders:'washington' }
+};
+
+// Convert an implied win probability (0..1) to an American moneyline string (e.g. -150, +130).
+function probToMoneyline(p) {
+    if (!(p > 0 && p < 1)) return '—';
+    const ml = p >= 0.5 ? -(p / (1 - p)) * 100 : ((1 - p) / p) * 100;
+    const r = Math.round(ml);
+    return (r > 0 ? '+' : '') + r;
+}
+
+// Pull a usable price (0..1) out of one candlestick: prefer the traded close, otherwise
+// the midpoint of the best bid/ask. Returns null if that hour had nothing to show.
+function candlePrice(c) {
+    const num = (v) => { const n = parseFloat(v); return isNaN(n) ? null : n; };
+    const close = c && c.price ? num(c.price.close_dollars) : null;
+    if (close != null && close > 0 && close < 1) return close;
+    const bid = c && c.yes_bid ? num(c.yes_bid.close_dollars) : null;
+    const ask = c && c.yes_ask ? num(c.yes_ask.close_dollars) : null;
+    if (bid != null && ask != null && bid > 0 && ask > 0) return (bid + ask) / 2;
+    if (ask != null && ask > 0 && ask < 1) return ask;
+    if (bid != null && bid > 0 && bid < 1) return bid;
+    return null;
+}
+
+// fetch() that won't hang forever — aborts after `ms` so a stuck request can't wedge a poll or a command.
+async function fetchWithTimeout(url, options = {}, ms = 15000) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), ms);
+    try {
+        return await fetch(url, { ...options, signal: controller.signal });
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+// Tiny in-memory cache so lookups close together don't hammer Kalshi (it rate-limits).
+const kalshiCache = new Map(); // path -> { at, data }
+function kalshiCacheGet(key, ttlMs) { const e = kalshiCache.get(key); return (e && Date.now() - e.at < ttlMs) ? e.data : null; }
+
+// GET a Kalshi endpoint as JSON: short cache, hard timeout, one retry if rate-limited.
+async function kalshiGet(path, ttlMs = 120000) {
+    const cached = kalshiCacheGet(path, ttlMs);
+    if (cached) return cached;
+    for (let attempt = 0; attempt < 2; attempt++) {
+        const resp = await fetchWithTimeout(KALSHI_BASE + path, { headers: { Accept: 'application/json' } }, 12000);
+        if (resp.status === 429) { await new Promise(r => setTimeout(r, 1500)); continue; }
+        if (!resp.ok) throw new Error(`Kalshi HTTP ${resp.status}`);
+        const data = await resp.json();
+        kalshiCache.set(path, { at: Date.now(), data });
+        return data;
+    }
+    throw new Error('Kalshi rate-limited');
+}
+
+// Score how well a user's query matches one market's team (0 = none, ~100 = exact).
+function teamMatchScore(query, leagueKey, market) {
+    const q = normTeam(query);
+    if (!q) return 0;
+    const team = normTeam(market.yes_sub_title);
+    const abbr = normTeam((market.ticker || '').split('-').pop());
+    const target = (KALSHI_ALIASES[leagueKey] || {})[q] || null;
+    const candidates = target ? [q, target] : [q];
+    let best = 0;
+    for (const c of candidates) {
+        if (!c) continue;
+        if (team === c || abbr === c) best = Math.max(best, c === q ? 100 : 99);
+        else if (team.includes(c) || c.includes(team)) best = Math.max(best, team.split(' ').length >= 2 ? 60 : 50);
+    }
+    if (abbr && abbr === q) best = Math.max(best, 95);
+    return best;
+}
+
+// Find the best current game market for a team. Searches one league (if given) or the
+// whole priority list, stopping early on a confident match. Returns { league, event,
+// market, score } or null.
+async function findKalshiMarket(query, leagueKey) {
+    const leagues = leagueKey ? KALSHI_LEAGUES.filter(l => l.key === leagueKey) : KALSHI_LEAGUES;
+    let overallBest = null;
+    for (const lg of leagues) {
+        let data;
+        try { data = await kalshiGet(`/events?series_ticker=${lg.series}&status=open&with_nested_markets=true&limit=80`); }
+        catch (e) { if (String(e.message).includes('rate')) throw e; continue; }
+        const events = (data && data.events) || [];
+        let leagueBest = null;
+        for (const ev of events) {
+            for (const m of (ev.markets || [])) {
+                const s = teamMatchScore(query, lg.key, m);
+                if (s <= 0) continue;
+                const better = !leagueBest || s > leagueBest.score ||
+                    (s === leagueBest.score && new Date(m.close_time) < new Date(leagueBest.market.close_time));
+                if (better) leagueBest = { league: lg, event: ev, market: m, score: s };
+            }
+        }
+        if (leagueBest) {
+            if (!overallBest || leagueBest.score > overallBest.score) overallBest = leagueBest;
+            if (leagueBest.score >= 90) break; // confident match — no need to search other leagues
+        }
+    }
+    return overallBest;
+}
+
+// Pull ~7 days of hourly price history for one market and return chart-ready points.
+async function fetchKalshiHistory(seriesTicker, marketTicker) {
+    const now = Math.floor(Date.now() / 1000);
+    const start = now - 7 * 24 * 3600;
+    const data = await kalshiGet(`/series/${seriesTicker}/markets/${marketTicker}/candlesticks?start_ts=${start}&end_ts=${now}&period_interval=60`, 300000);
+    const candles = (data && data.candlesticks) || [];
+    const points = [];
+    for (const c of candles) {
+        const p = candlePrice(c);
+        if (p == null) continue;
+        points.push({ ts: (c.end_period_ts || 0) * 1000, prob: p });
+    }
+    points.sort((a, b) => a.ts - b.ts); // chart oldest -> newest, even if upstream order changes
+    return points;
+}
+
+// Build a hosted line-chart image (via QuickChart) and return its URL.
+async function makeChartUrl(config) {
+    const resp = await fetchWithTimeout('https://quickchart.io/chart/create', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chart: config, width: 700, height: 360, backgroundColor: 'white' })
+    });
+    const data = await resp.json();
+    if (data && data.success && data.url) return data.url;
+    throw new Error('chart create failed');
+}
+
+// Format a timestamp like "6/13 2 PM" in US Eastern time
+function shortTime(d) {
+    try {
+        return new Date(d).toLocaleString('en-US', {
+            timeZone: 'America/New_York', month: 'numeric', day: 'numeric', hour: 'numeric'
+        }).replace(',', '');
+    } catch (e) {
+        return new Date(d).toISOString().slice(5, 16);
+    }
+}
+
 // ====== BOT READY & COMMAND REGISTRATION ======
 client.once('ready', async () => {
     console.log(`${client.user.tag} is online!`);
@@ -194,6 +372,23 @@ client.once('ready', async () => {
         { name: 'resetleaderboard', description: 'Admin: reset the entire leaderboard', defaultMemberPermissions: ADMIN_ONLY },
         { name: 'verifywin', description: 'Admin: log a win for a user', options: [{ name: 'target', type: 6, description: 'User to verify', required: true }], defaultMemberPermissions: ADMIN_ONLY },
         { name: 'stats', description: 'Look up sports stats (members chat only)', options: [{ name: 'question', type: 3, description: 'e.g. LeBron James points this season', required: true }] },
+        { name: 'linehistory', description: 'Show how a team\'s win odds have moved (members chat only)', options: [
+            { name: 'team', type: 3, description: 'Team or player, e.g. Yankees, Lakers, Real Madrid', required: true },
+            { name: 'league', type: 3, description: 'Optional: narrow the search to one league', required: false, choices: [
+                { name: 'MLB', value: 'mlb' },
+                { name: 'NBA', value: 'nba' },
+                { name: 'NHL', value: 'nhl' },
+                { name: 'WNBA', value: 'wnba' },
+                { name: 'NFL', value: 'nfl' },
+                { name: 'College Football', value: 'ncaaf' },
+                { name: 'College Basketball', value: 'ncaab' },
+                { name: 'MLS', value: 'mls' },
+                { name: 'Premier League', value: 'epl' },
+                { name: 'Champions League', value: 'ucl' },
+                { name: 'ATP Tennis', value: 'atp' },
+                { name: 'WTA Tennis', value: 'wta' }
+            ] }
+        ] },
         { name: 'parlay', description: 'Calculate parlay odds & payout (wins channel only)', options: [{ name: 'odds', type: 3, description: 'Odds per leg, e.g. +150 -110 +200', required: true }, { name: 'stake', type: 10, description: 'Amount you are betting (optional)', required: false }], defaultMemberPermissions: ADMIN_ONLY }
     ];
 
@@ -207,6 +402,8 @@ client.once('ready', async () => {
     } catch (error) {
         console.error('Error registering commands:', error);
     }
+
+    // /linehistory pulls win-odds from Kalshi live, on demand — nothing to schedule here.
 });
 
 // ====== #bet-slips: IMAGES/SCREENSHOTS/FILES ONLY + LOG SLIPS ======
@@ -472,6 +669,98 @@ client.on('interactionCreate', async interaction => {
         }
         embed.setFooter({ text: `${legs.length}-leg parlay` });
         await interaction.reply({ embeds: [embed] });
+    }
+
+    // ===== /linehistory — line movement graph, MEMBERS CHAT ONLY, public =====
+    if (commandName === 'linehistory') {
+        const norm = (interaction.channel?.name || '').toLowerCase().replace(/[^a-z]/g, '');
+        if (!norm.includes('memberschat')) {
+            return interaction.reply({ content: '📈 The `/linehistory` command can only be used in the members chat.', ephemeral: true });
+        }
+        const teamQuery = options.getString('team');
+        const leagueKey = options.getString('league') || null;
+        await interaction.deferReply();
+        try {
+            // 1) Find the current/upcoming game market for this team on Kalshi.
+            const match = await findKalshiMarket(teamQuery, leagueKey);
+            if (!match) {
+                return interaction.editReply(
+                    `I couldn't find a current game for **${teamQuery}**.\n` +
+                    `• Try the team name or city — e.g. \`Yankees\`, \`Lakers\`, \`Real Madrid\`.\n` +
+                    `• That league may be off-season, or the game isn't listed yet (games show up a few days before they start).\n` +
+                    `• Tip: pick a **league** in the command to search faster.`
+                );
+            }
+            const { league, event, market } = match;
+            const teamName = market.yes_sub_title || teamQuery;
+
+            // 2) Pull this market's price history (= win-chance over time).
+            const points = await fetchKalshiHistory(league.series, market.ticker);
+            if (points.length === 0) {
+                const nowP = candlePrice({ price: {}, yes_ask: { close_dollars: market.yes_ask_dollars }, yes_bid: { close_dollars: market.yes_bid_dollars } });
+                const nowStr = nowP != null ? `**${Math.round(nowP * 100)}%** (moneyline ${probToMoneyline(nowP)})` : 'not priced yet';
+                return interaction.editReply(
+                    `Found **${event.title}** (${league.name}) but there's no price history yet.\n` +
+                    `Current win chance for **${teamName}**: ${nowStr}.\n` +
+                    `Check back closer to game time and the movement line will fill in.`
+                );
+            }
+
+            // 3) Keep the chart readable if there are lots of hourly readings.
+            let plot = points;
+            if (plot.length > 60) {
+                const step = Math.ceil(plot.length / 60);
+                plot = points.filter((_, i) => i % step === 0 || i === points.length - 1);
+            }
+            const labels = plot.map(p => shortTime(p.ts));
+            const values = plot.map(p => Math.round(p.prob * 100));
+            const first = points[0].prob;
+            const latest = points[points.length - 1].prob;
+
+            const chartConfig = {
+                type: 'line',
+                data: {
+                    labels,
+                    datasets: [{
+                        label: `${teamName} win chance (%)`,
+                        data: values,
+                        fill: false,
+                        borderColor: '#00AE86',
+                        backgroundColor: '#00AE86',
+                        lineTension: 0.2,
+                        pointRadius: 2
+                    }]
+                },
+                options: {
+                    title: { display: true, text: `${event.title} — ${teamName} win odds` },
+                    legend: { display: false },
+                    scales: { yAxes: [{ ticks: { suggestedMin: 0, suggestedMax: 100 }, scaleLabel: { display: true, labelString: 'Win chance (%)' } }] }
+                }
+            };
+
+            let imageUrl = null;
+            try { imageUrl = await makeChartUrl(chartConfig); }
+            catch (e) { console.error('chart error:', e.message); }
+
+            const embed = new EmbedBuilder()
+                .setColor(0x00AE86)
+                .setTitle(`📈 Line Movement — ${event.title}`)
+                .setDescription(
+                    `**${teamName}** to win · ${league.name}\n` +
+                    `Now: **${Math.round(latest * 100)}%**  (moneyline **${probToMoneyline(latest)}**)\n` +
+                    `Earlier this week: about **${Math.round(first * 100)}%** (${probToMoneyline(first)})\n` +
+                    `${points.length} hourly reading${points.length === 1 ? '' : 's'}`
+                )
+                .setFooter({ text: 'Live win odds via Kalshi · refreshed each time you run the command' });
+            if (imageUrl) embed.setImage(imageUrl);
+            await interaction.editReply({ embeds: [embed] });
+        } catch (e) {
+            console.error('linehistory command error:', e);
+            const msg = String(e.message || '').includes('rate')
+                ? 'Kalshi is busy right now (too many requests in a row). Please try again in a few seconds.'
+                : 'Something went wrong building the line history. Please try again in a moment.';
+            await interaction.editReply(msg);
+        }
     }
 });
 
@@ -816,7 +1105,7 @@ app.get('/oauth/callback', async (req, res) => {
     }
 });
 
-const BUILD_MARKER = 'cmd-perms-2026-06-13-4';
+const BUILD_MARKER = 'linehistory-kalshi-2026-06-13-1';
 app.get('/', (_req, res) => {
     let betSlips = 'unknown';
     try {
