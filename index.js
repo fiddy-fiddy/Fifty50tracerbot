@@ -204,10 +204,33 @@ client.once('ready', async () => {
     }
 });
 
-// ====== LOG ALL SLIPS AND SEND ALERTS ======
+// ====== #bet-slips: IMAGES/SCREENSHOTS/FILES ONLY + LOG SLIPS ======
 client.on('messageCreate', async message => {
-    if (message.channel.name !== 'bet-slips') return;
-    if (message.author.bot) return;
+    if (message.author.bot || !message.guild) return;
+    // Match the bet-slips channel even if it has an emoji/separator in the name
+    const cname = (message.channel.name || '').toLowerCase().replace(/[^a-z]/g, '');
+    if (!cname.includes('betslips')) return;
+
+    const hasAttachment = message.attachments.size > 0;
+
+    // Staff (owner/mods) can post text freely — e.g. to rank or comment on slips
+    const isStaff = message.member?.permissions?.has(PermissionFlagsBits.ManageMessages)
+        || message.member?.permissions?.has(PermissionFlagsBits.Administrator);
+
+    // Regular members must post an image/screenshot/file — delete text-only posts
+    if (!hasAttachment && !isStaff) {
+        try {
+            await message.delete();
+            const warn = await message.channel.send(`<@${message.author.id}> this channel is for **images / screenshots / files only** — please post your bet slip as an image. 🧾`);
+            setTimeout(() => warn.delete().catch(() => {}), 7000);
+        } catch (e) {
+            console.error('bet-slips delete failed (needs Manage Messages permission?):', e.message);
+        }
+        return;
+    }
+
+    // Only log actual slips (messages that include an attachment); skip staff text notes
+    if (!hasAttachment) return;
 
     let attachmentUrl = message.attachments.first() ? message.attachments.first().url : null;
     let slip = {
@@ -698,12 +721,32 @@ app.get('/oauth/callback', async (req, res) => {
     }
 });
 
-app.get('/', (_req, res) => res.send('FiddyBot is running!'));
+const BUILD_MARKER = 'betslips-enforce-2026-06-13-1';
+app.get('/', (_req, res) => {
+    let betSlips = 'unknown';
+    try {
+        const g = client.guilds.cache.get(process.env.DISCORD_GUILD_ID);
+        if (!g) {
+            betSlips = 'guild-not-cached';
+        } else {
+            const ch = g.channels.cache.find(c => c.name && c.name.toLowerCase().replace(/[^a-z]/g, '').includes('betslips'));
+            betSlips = ch ? { id: ch.id, name: ch.name } : 'not-found';
+        }
+    } catch (e) {
+        betSlips = 'err:' + e.message;
+    }
+    res.json({
+        status: 'FiddyBot is running!',
+        build: BUILD_MARKER,
+        botReady: client.isReady(),
+        botTag: client.user ? client.user.tag : null,
+        betSlipsChannel: betSlips
+    });
+});
 
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, '0.0.0.0', () => console.log(`Webhook server listening on port ${PORT}`));
 
 // ====== LOGIN ======
 client.login(process.env.DISCORD_BOT_TOKEN);
-
 
