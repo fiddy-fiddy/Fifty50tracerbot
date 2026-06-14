@@ -55,6 +55,23 @@ async function initDb() {
             created_at TIMESTAMPTZ DEFAULT NOW()
         );
         ALTER TABLE bot_checkout_sessions ADD COLUMN IF NOT EXISTS used BOOLEAN DEFAULT FALSE;
+        CREATE TABLE IF NOT EXISTS bot_watches (
+            id SERIAL PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            league_key TEXT NOT NULL,
+            event_id TEXT NOT NULL,
+            event_name TEXT,
+            player_name TEXT NOT NULL,
+            stat_key TEXT NOT NULL,
+            target_value INTEGER NOT NULL,
+            last_value INTEGER DEFAULT 0,
+            last_notified_value INTEGER DEFAULT 0,
+            status TEXT DEFAULT 'active',
+            created_at TIMESTAMPTZ DEFAULT NOW(),
+            updated_at TIMESTAMPTZ DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS bot_watches_active_idx ON bot_watches (status, event_id);
+        CREATE UNIQUE INDEX IF NOT EXISTS bot_watches_unique_active ON bot_watches (user_id, event_id, player_name, stat_key) WHERE status = 'active';
     `);
     console.log('Database tables ready.');
 }
@@ -123,22 +140,18 @@ const client = new Client({
 // ====== DATA STORAGE (JSON for bot features, DB for subscribers) ======
 let followers = {};
 let slips = [];
-let leaderboard = {};
 let alerts = {};
 
 const FOLLOWERS_FILE = './followers.json';
 const SLIPS_FILE = './slips.json';
-const LEADERBOARD_FILE = './leaderboard.json';
 const ALERTS_FILE = './alerts.json';
 
 if (fs.existsSync(FOLLOWERS_FILE)) followers = JSON.parse(fs.readFileSync(FOLLOWERS_FILE));
 if (fs.existsSync(SLIPS_FILE)) slips = JSON.parse(fs.readFileSync(SLIPS_FILE));
-if (fs.existsSync(LEADERBOARD_FILE)) leaderboard = JSON.parse(fs.readFileSync(LEADERBOARD_FILE));
 if (fs.existsSync(ALERTS_FILE)) alerts = JSON.parse(fs.readFileSync(ALERTS_FILE));
 
 function saveFollowers() { fs.writeFileSync(FOLLOWERS_FILE, JSON.stringify(followers, null, 2)); }
 function saveSlips() { fs.writeFileSync(SLIPS_FILE, JSON.stringify(slips, null, 2)); }
-function saveLeaderboard() { fs.writeFileSync(LEADERBOARD_FILE, JSON.stringify(leaderboard, null, 2)); }
 function saveAlerts() { fs.writeFileSync(ALERTS_FILE, JSON.stringify(alerts, null, 2)); }
 
 // ====== SWEEP: kick anyone without PAID role or admin perms ======
@@ -544,6 +557,241 @@ function shortTime(d) {
     }
 }
 
+// ====== LIVE SCORES / INJURIES / PROP WATCHES (ESPN public API — free, no key) ======
+const ESPN_BASE = 'https://site.api.espn.com/apis/site/v2/sports';
+
+// friendly league key -> ESPN sport/league path, listed in search priority order
+const ESPN_LEAGUES = [
+    { key: 'nba',   name: 'NBA',                sport: 'basketball', league: 'nba' },
+    { key: 'wnba',  name: 'WNBA',               sport: 'basketball', league: 'wnba' },
+    { key: 'nfl',   name: 'NFL',                sport: 'football',   league: 'nfl' },
+    { key: 'ncaaf', name: 'College Football',   sport: 'football',   league: 'college-football' },
+    { key: 'ncaab', name: 'College Basketball', sport: 'basketball', league: 'mens-college-basketball' },
+    { key: 'mlb',   name: 'MLB',                sport: 'baseball',   league: 'mlb' },
+    { key: 'nhl',   name: 'NHL',                sport: 'hockey',     league: 'nhl' },
+    { key: 'wc',    name: 'World Cup',          sport: 'soccer',     league: 'fifa.world' },
+    { key: 'epl',   name: 'Premier League',     sport: 'soccer',     league: 'eng.1' },
+    { key: 'ucl',   name: 'Champions League',   sport: 'soccer',     league: 'uefa.champions' },
+    { key: 'mls',   name: 'MLS',                sport: 'soccer',     league: 'usa.1' }
+];
+const espnLeague = key => ESPN_LEAGUES.find(l => l.key === key) || null;
+
+// small cache so repeated lookups + the watch poller don't hammer ESPN
+const espnCache = new Map(); // url -> { at, data }
+async function espnGet(url, ttlMs) {
+    const hit = espnCache.get(url);
+    if (hit && Date.now() - hit.at < ttlMs) return hit.data;
+    const resp = await fetchWithTimeout(url, { headers: { 'User-Agent': 'Mozilla/5.0 (compatible; FiddyBot/1.0)' } }, 12000);
+    if (!resp.ok) throw new Error(`ESPN HTTP ${resp.status}`);
+    const data = await resp.json();
+    espnCache.set(url, { at: Date.now(), data });
+    return data;
+}
+async function espnScoreboard(lg) {
+    const data = await espnGet(`${ESPN_BASE}/${lg.sport}/${lg.league}/scoreboard`, 25000);
+    return (data && data.events) || [];
+}
+async function espnSummary(lg, eventId) {
+    return espnGet(`${ESPN_BASE}/${lg.sport}/${lg.league}/summary?event=${eventId}`, 35000);
+}
+
+// score a team query against an ESPN event (city/nickname/abbr all live in the team object)
+function espnTeamScore(query, ev) {
+    const q = normTeam(query);
+    if (!q) return 0;
+    const comp = (ev.competitions && ev.competitions[0]) || {};
+    let best = 0;
+    for (const c of (comp.competitors || [])) {
+        const t = c.team || {};
+        const cands = [t.displayName, t.shortDisplayName, t.name, t.location, t.nickname, t.abbreviation]
+            .filter(Boolean).map(normTeam);
+        for (const cand of cands) {
+            if (!cand) continue;
+            if (cand === q) best = Math.max(best, 100);
+            else if (cand.split(' ').includes(q)) best = Math.max(best, 88);
+            else if (cand.includes(q) || q.includes(cand)) best = Math.max(best, 80);
+        }
+    }
+    return best;
+}
+
+// prefer a game that's live, then the soonest upcoming, then the most recent
+function espnGameRank(ev) {
+    const state = ev.status && ev.status.type && ev.status.type.state;
+    if (state === 'in') return 0;
+    if (state === 'pre') return 1;
+    return 2;
+}
+
+// find the best game for a team query in one league, or across all leagues (priority order)
+async function findEspnGame(query, leagueKey) {
+    const leagues = leagueKey ? [espnLeague(leagueKey)].filter(Boolean) : ESPN_LEAGUES;
+    let best = null;
+    for (const lg of leagues) {
+        let events;
+        try { events = await espnScoreboard(lg); } catch (e) { continue; }
+        for (const ev of events) {
+            const score = espnTeamScore(query, ev);
+            if (score < 80) continue;
+            const cand = { lg, ev, score, rank: espnGameRank(ev), when: Date.parse(ev.date) || 0 };
+            if (!best) { best = cand; continue; }
+            if (cand.score !== best.score) { if (cand.score > best.score) best = cand; }
+            else if (cand.rank !== best.rank) { if (cand.rank < best.rank) best = cand; }
+            else if (cand.rank === 1) { if (cand.when < best.when) best = cand; } // soonest upcoming
+            else { if (cand.when > best.when) best = cand; }                       // most recent otherwise
+        }
+        if (best && best.score >= 100 && best.rank === 0) break; // live exact hit — stop scanning
+    }
+    return best;
+}
+
+// pull both teams' scores into a readable line
+function espnScoreLine(ev) {
+    const comp = (ev.competitions && ev.competitions[0]) || {};
+    const cs = comp.competitors || [];
+    const away = cs.find(c => c.homeAway === 'away') || cs[0] || {};
+    const home = cs.find(c => c.homeAway === 'home') || cs[1] || {};
+    const an = (away.team && away.team.displayName) || 'Away';
+    const hn = (home.team && home.team.displayName) || 'Home';
+    const aScore = away.score != null ? away.score : '-';
+    const hScore = home.score != null ? home.score : '-';
+    return { an, hn, aScore, hScore, line: `${an} **${aScore}**  —  **${hScore}** ${hn}` };
+}
+
+// ---- /watchprop: live player-prop tracking (basketball is where ESPN posts live box scores) ----
+const WATCH_STATS = {
+    points:   { word: 'points',     labels: ['PTS'] },
+    rebounds: { word: 'rebounds',   labels: ['REB'] },
+    assists:  { word: 'assists',    labels: ['AST'] },
+    threes:   { word: '3-pointers', labels: ['3PT', '3P'], madeAtt: true },
+    steals:   { word: 'steals',     labels: ['STL'] },
+    blocks:   { word: 'blocks',     labels: ['BLK'] }
+};
+
+// turn a raw box-score cell into a number; for "made-attempted" cells (e.g. 3PT "2-5") take the made count
+function parseStatNumber(raw, madeAtt) {
+    if (raw == null) return null;
+    let s = String(raw).trim();
+    if (madeAtt && s.includes('-')) s = s.split('-')[0];
+    const n = parseInt(s.replace(/[^0-9-]/g, ''), 10);
+    return Number.isNaN(n) ? null : n;
+}
+
+// find a player's current value for a stat inside a game summary's box score
+function readPlayerStat(summary, playerQuery, statKey) {
+    const def = WATCH_STATS[statKey];
+    if (!def) return null;
+    const teams = (summary.boxscore && summary.boxscore.players) || [];
+    let best = null;
+    for (const tp of teams) {
+        const teamName = tp.team && tp.team.displayName;
+        for (const grp of (tp.statistics || [])) {
+            const labels = grp.labels || [];
+            let idx = -1;
+            for (const L of def.labels) { const i = labels.indexOf(L); if (i >= 0) { idx = i; break; } }
+            if (idx < 0) continue;
+            for (const a of (grp.athletes || [])) {
+                const name = a.athlete && a.athlete.displayName;
+                const sc = playerMatchScore(playerQuery, name);
+                if (sc <= 0) continue;
+                const val = parseStatNumber((a.stats || [])[idx], def.madeAtt);
+                const cand = { value: val == null ? 0 : val, player: name, team: teamName, score: sc };
+                if (!best || cand.score > best.score) best = cand;
+            }
+        }
+    }
+    return best;
+}
+
+// read the game state ('pre' | 'in' | 'post') from a summary
+function summaryState(summary) {
+    const comp = summary && summary.header && summary.header.competitions && summary.header.competitions[0];
+    return (comp && comp.status && comp.status.type && comp.status.type.state) || null;
+}
+
+// find a LIVE game that currently shows this player in its box score
+async function findPlayerWatchGame(playerQuery, leagueKey, statKey) {
+    const leagues = leagueKey ? [espnLeague(leagueKey)].filter(Boolean) : ESPN_LEAGUES;
+    let best = null;
+    for (const lg of leagues) {
+        let events;
+        try { events = await espnScoreboard(lg); } catch (e) { continue; }
+        for (const ev of events) {
+            const state = ev.status && ev.status.type && ev.status.type.state;
+            if (state !== 'in') continue; // box scores only exist once a game is live
+            let summary;
+            try { summary = await espnSummary(lg, ev.id); } catch (e) { continue; }
+            const hit = readPlayerStat(summary, playerQuery, statKey);
+            if (!hit) continue;
+            const cand = { lg, ev, player: hit.player, value: hit.value, score: hit.score };
+            if (!best || cand.score > best.score) best = cand;
+        }
+        if (best && best.score >= 90) break;
+    }
+    return best;
+}
+
+// DM a user by id, swallowing errors (closed DMs etc.) so the poller never crashes
+async function dmUser(userId, content) {
+    try { const u = await client.users.fetch(userId); await u.send(content); }
+    catch (e) { console.error(`watch DM to ${userId} failed:`, e.message); }
+}
+
+// ---- watch poller: checks each active watch's game and DMs the owner as the stat moves ----
+let watchPollRunning = false;
+async function pollWatches() {
+    if (watchPollRunning) return;          // overlap guard
+    watchPollRunning = true;
+    try {
+        const { rows } = await dbQuery(`SELECT * FROM bot_watches WHERE status = 'active' ORDER BY league_key, event_id`);
+        if (rows.length) {
+            const groups = new Map();      // one summary fetch per game
+            for (const w of rows) {
+                const k = w.league_key + '|' + w.event_id;
+                if (!groups.has(k)) groups.set(k, []);
+                groups.get(k).push(w);
+            }
+            for (const watches of groups.values()) {
+                const lg = espnLeague(watches[0].league_key);
+                if (!lg) continue;
+                let summary;
+                try { summary = await espnSummary(lg, watches[0].event_id); } catch (e) { continue; }
+                const state = summaryState(summary);
+                for (const w of watches) {
+                    try {
+                        const def = WATCH_STATS[w.stat_key];
+                        const word = def ? def.word : w.stat_key;
+                        const hit = readPlayerStat(summary, w.player_name, w.stat_key);
+                        const cur = hit ? hit.value : w.last_value;
+                        if (hit && cur > w.last_notified_value) {
+                            const justHit = cur >= w.target_value && w.last_notified_value < w.target_value;
+                            const msg = justHit
+                                ? `🎯 **${w.player_name}** hit **${cur} ${word}** — that clears your target of **${w.target_value}**! (${w.event_name})`
+                                : `📈 **${w.player_name}** is up to **${cur} ${word}** (target ${w.target_value}) — ${w.event_name}`;
+                            await dmUser(w.user_id, msg);
+                            await dbQuery(`UPDATE bot_watches SET last_value=$1, last_notified_value=$1, updated_at=NOW() WHERE id=$2`, [cur, w.id]);
+                        } else if (hit && cur !== w.last_value) {
+                            await dbQuery(`UPDATE bot_watches SET last_value=$1, updated_at=NOW() WHERE id=$2`, [cur, w.id]);
+                        }
+                        if (state === 'post') {
+                            const finalVal = hit ? hit.value : w.last_value;
+                            const verdict = finalVal >= w.target_value ? 'cleared ✅' : 'came up short ❌';
+                            await dmUser(w.user_id, `🏁 Final — **${w.player_name}** finished with **${finalVal} ${word}** (target ${w.target_value}). Your watch ${verdict}. (${w.event_name})`);
+                            await dbQuery(`UPDATE bot_watches SET status='done', last_value=$1, updated_at=NOW() WHERE id=$2`, [finalVal, w.id]);
+                        }
+                    } catch (e) { console.error('watch row error:', e.message); }
+                }
+            }
+        }
+        // close out anything active too long (e.g. a game that never resolved cleanly)
+        await dbQuery(`UPDATE bot_watches SET status='done', updated_at=NOW() WHERE status='active' AND created_at < NOW() - INTERVAL '8 hours'`);
+    } catch (e) {
+        console.error('pollWatches error:', e.message);
+    } finally {
+        watchPollRunning = false;
+    }
+}
+
 // ====== BOT READY & COMMAND REGISTRATION ======
 client.once('ready', async () => {
     console.log(`${client.user.tag} is online!`);
@@ -557,17 +805,15 @@ client.once('ready', async () => {
     // setInterval(sweepUnpaidMembers, 6 * 60 * 60 * 1000);
 
     // Admin-only commands are hidden from regular members via defaultMemberPermissions.
-    // Only /stats is visible to everyone.
+    // /stats, /linehistory, /livescore, /reports and /watchprop are open to all members.
     const ADMIN_ONLY = PermissionFlagsBits.ManageGuild;
+    const espnLeagueChoices = ESPN_LEAGUES.map(l => ({ name: l.name, value: l.key }));
     const data = [
         { name: 'follow', description: 'Follow a bettor', options: [{ name: 'target', type: 6, description: 'User to follow', required: true }], defaultMemberPermissions: ADMIN_ONLY },
         { name: 'unfollow', description: 'Stop following a bettor', options: [{ name: 'target', type: 6, description: 'User to unfollow', required: true }], defaultMemberPermissions: ADMIN_ONLY },
         { name: 'following', description: 'See who you are following', defaultMemberPermissions: ADMIN_ONLY },
         { name: 'feed', description: 'See recent slips from users you follow', defaultMemberPermissions: ADMIN_ONLY },
         { name: 'alerts', description: 'Turn DM alerts on or off', options: [{ name: 'state', type: 3, description: 'on or off', required: true }], defaultMemberPermissions: ADMIN_ONLY },
-        { name: 'addwin', description: 'Add a win to the leaderboard', options: [{ name: 'name', type: 3, description: 'Bettor name', required: true }, { name: 'odds', type: 4, description: 'Win amount (+/- value)', required: true }], defaultMemberPermissions: ADMIN_ONLY },
-        { name: 'resetleaderboard', description: 'Admin: reset the entire leaderboard', defaultMemberPermissions: ADMIN_ONLY },
-        { name: 'verifywin', description: 'Admin: log a win for a user', options: [{ name: 'target', type: 6, description: 'User to verify', required: true }], defaultMemberPermissions: ADMIN_ONLY },
         { name: 'stats', description: 'Look up sports stats (members chat only)', options: [{ name: 'question', type: 3, description: 'e.g. LeBron James points this season', required: true }] },
         { name: 'linehistory', description: 'Show how a team or player\'s odds have moved (members chat only)', options: [
             { name: 'team', type: 3, description: 'Team OR player name — e.g. Lakers, Wembanyama, Salah', required: true },
@@ -598,6 +844,27 @@ client.once('ready', async () => {
                 { name: 'Shots (soccer)', value: 'shots' }
             ] }
         ] },
+        { name: 'livescore', description: 'Live score for a game (any sport)', options: [
+            { name: 'team', type: 3, description: 'Team or city — e.g. Lakers, Real Madrid', required: true },
+            { name: 'league', type: 3, description: 'Optional: pick the league to search faster', required: false, choices: espnLeagueChoices }
+        ] },
+        { name: 'reports', description: 'Injury report for a team\'s game', options: [
+            { name: 'team', type: 3, description: 'Team or city — e.g. Knicks, Chiefs', required: true },
+            { name: 'league', type: 3, description: 'Optional: pick the league to search faster', required: false, choices: espnLeagueChoices }
+        ] },
+        { name: 'watchprop', description: 'Watch a player\'s live stat and get DMs as it climbs', options: [
+            { name: 'player', type: 3, description: 'Player name — e.g. LeBron James', required: true },
+            { name: 'stat', type: 3, description: 'Which stat to watch', required: true, choices: [
+                { name: 'Points', value: 'points' },
+                { name: 'Rebounds', value: 'rebounds' },
+                { name: 'Assists', value: 'assists' },
+                { name: '3-Pointers', value: 'threes' },
+                { name: 'Steals', value: 'steals' },
+                { name: 'Blocks', value: 'blocks' }
+            ] },
+            { name: 'target', type: 4, description: 'Your number — e.g. 25', required: true, min_value: 1 },
+            { name: 'league', type: 3, description: 'Optional: pick the league to find the game faster', required: false, choices: espnLeagueChoices }
+        ] },
         { name: 'parlay', description: 'Calculate parlay odds & payout (wins channel only)', options: [{ name: 'odds', type: 3, description: 'Odds per leg, e.g. +150 -110 +200', required: true }, { name: 'stake', type: 10, description: 'Amount you are betting (optional)', required: false }], defaultMemberPermissions: ADMIN_ONLY }
     ];
 
@@ -613,6 +880,10 @@ client.once('ready', async () => {
     }
 
     // /linehistory pulls win-odds from Kalshi live, on demand — nothing to schedule here.
+
+    // Start the prop-watch poller: checks each active watch's live game and DMs the owner as stats move.
+    pollWatches();
+    setInterval(pollWatches, 45000);
 });
 
 // ====== #bet-slips: IMAGES/SCREENSHOTS/FILES ONLY + LOG SLIPS ======
@@ -665,56 +936,6 @@ client.on('messageCreate', async message => {
         }
     }
 });
-
-// ====== AUTO LEADERBOARD TRACKING ======
-const WINS_CHANNEL = 'wins';
-
-client.on('messageCreate', async (message) => {
-    if (message.author.bot || !message.guild) return;
-    if (message.channel.name !== WINS_CHANNEL) return;
-
-    const lines = message.content.split('\n');
-    for (const line of lines) {
-        const match = line.trim().match(/^(.+?)\s([+-]\d+)$/);
-        if (!match) continue;
-
-        const name = match[1];
-        const odds = parseInt(match[2]);
-        if (!leaderboard[name]) leaderboard[name] = 0;
-        leaderboard[name] += odds;
-    }
-
-    saveLeaderboard();
-    updateLeaderboardEmbed(message.guild);
-});
-
-async function updateLeaderboardEmbed(guild) {
-    const lbChannel = guild.channels.cache.find(c => c.name.toLowerCase().includes('leaderboard'));
-    if (!lbChannel) return;
-
-    const sorted = Object.entries(leaderboard).sort((a, b) => b[1] - a[1]).slice(0, 10);
-    let output = '';
-    let rank = 1;
-
-    for (let i = 0; i < sorted.length; i++) {
-        const [name, value] = sorted[i];
-        if (i > 0 && value !== sorted[i - 1][1]) rank = i + 1;
-        const sign = value >= 0 ? '+' : '';
-        const medal = rank === 1 ? '🥇 ' : rank === 2 ? '🥈 ' : rank === 3 ? '🥉 ' : '🔹 ';
-        output += `${medal}**#${rank}** ${name} • \`${sign}${value}\`\n`;
-    }
-
-    const embed = new EmbedBuilder()
-        .setTitle('🏆 Fifty50 Leaderboard 🏆')
-        .setDescription(output || 'No records yet!')
-        .setColor(0x00AE86)
-        .setTimestamp()
-        .setFooter({ text: 'Fifty50 Betting Community' });
-
-    const messages = await lbChannel.messages.fetch({ limit: 5 });
-    await lbChannel.bulkDelete(messages);
-    lbChannel.send({ embeds: [embed] });
-}
 
 // Decode common HTML entities found in StatMuse meta tags
 function decodeEntities(str) {
@@ -777,29 +998,6 @@ client.on('interactionCreate', async interaction => {
         alerts[user.id] = toggle.toLowerCase() === 'on';
         saveAlerts();
         await interaction.reply(`DM alerts turned **${toggle.toUpperCase()}**`);
-    }
-
-    if (commandName === 'addwin') {
-        if (!interaction.member.permissions.has(PermissionFlagsBits.ManageGuild)) {
-            return interaction.reply({ content: 'No permission.', ephemeral: true });
-        }
-        const name = options.getString('name');
-        const odds = options.getInteger('odds');
-        if (!leaderboard[name]) leaderboard[name] = 0;
-        leaderboard[name] += odds;
-        saveLeaderboard();
-        updateLeaderboardEmbed(interaction.guild);
-        await interaction.reply(`Added win for ${name}`);
-    }
-
-    if (commandName === 'resetleaderboard') {
-        if (!interaction.member.permissions.has(PermissionFlagsBits.ManageGuild)) {
-            return interaction.reply({ content: 'No permission.', ephemeral: true });
-        }
-        leaderboard = {};
-        saveLeaderboard();
-        updateLeaderboardEmbed(interaction.guild);
-        await interaction.reply('Leaderboard reset.');
     }
 
     // ===== /stats — StatMuse lookup, MEMBERS CHAT ONLY, public =====
@@ -1000,6 +1198,144 @@ client.on('interactionCreate', async interaction => {
             await interaction.editReply(msg);
         }
     }
+
+    // ===== /livescore — live score for any game, #tools (or members chat) =====
+    if (commandName === 'livescore') {
+        const norm = (interaction.channel?.name || '').toLowerCase().replace(/[^a-z]/g, '');
+        if (!norm.includes('tools') && !norm.includes('memberschat')) {
+            return interaction.reply({ content: '📺 The `/livescore` command can be used in the #tools channel.', ephemeral: true });
+        }
+        const team = options.getString('team');
+        const leagueKey = options.getString('league') || null;
+        await interaction.deferReply();
+        try {
+            const game = await findEspnGame(team, leagueKey);
+            if (!game) {
+                return interaction.editReply(
+                    `I couldn't find a game for **${team}**.\n` +
+                    `• Try the team name or city — e.g. \`Lakers\`, \`Real Madrid\`.\n` +
+                    `• It may be the off-season, or the game isn't on today's board yet.\n` +
+                    `• Tip: pick a **league** from the list to search faster.`
+                );
+            }
+            const { lg, ev } = game;
+            const st = (ev.status && ev.status.type) || {};
+            const sc = espnScoreLine(ev);
+            let body;
+            if (st.state === 'pre') {
+                body = `**${sc.an}** vs **${sc.hn}**\n🗓️ ${st.detail || st.shortDetail || new Date(ev.date).toLocaleString()}`;
+            } else if (st.state === 'in') {
+                const clock = [ev.status && ev.status.displayClock, st.shortDetail].filter(Boolean).join(' · ');
+                body = `${sc.line}\n🔴 LIVE — ${clock || 'in progress'}`;
+            } else {
+                body = `${sc.line}\n✅ Final${st.shortDetail ? ' — ' + st.shortDetail : ''}`;
+            }
+            const embed = new EmbedBuilder()
+                .setColor(0x00AE86)
+                .setTitle(`📺 ${ev.name}`)
+                .setDescription(`${body}\n_${lg.name}_`)
+                .setFooter({ text: 'Live scores via ESPN · run again to refresh' });
+            await interaction.editReply({ embeds: [embed] });
+        } catch (e) {
+            console.error('livescore command error:', e);
+            await interaction.editReply('Something went wrong getting that score. Please try again in a moment.');
+        }
+    }
+
+    // ===== /reports — injury report for a team's game, #tools (or members chat) =====
+    if (commandName === 'reports') {
+        const norm = (interaction.channel?.name || '').toLowerCase().replace(/[^a-z]/g, '');
+        if (!norm.includes('tools') && !norm.includes('memberschat')) {
+            return interaction.reply({ content: '🩹 The `/reports` command can be used in the #tools channel.', ephemeral: true });
+        }
+        const team = options.getString('team');
+        const leagueKey = options.getString('league') || null;
+        await interaction.deferReply();
+        try {
+            const game = await findEspnGame(team, leagueKey);
+            if (!game) {
+                return interaction.editReply(`I couldn't find a game for **${team}**. Try the team name or city, or pick a **league** from the list.`);
+            }
+            const { lg, ev } = game;
+            let summary;
+            try { summary = await espnSummary(lg, ev.id); } catch (e) { summary = null; }
+            const groups = (summary && summary.injuries) || [];
+            const fields = [];
+            for (const g of groups) {
+                const tn = (g.team && g.team.displayName) || 'Team';
+                const items = (g.injuries || []).map(it => {
+                    const who = (it.athlete && it.athlete.displayName) || 'Unknown';
+                    const status = it.status || (it.type && it.type.description) || 'Out';
+                    return `• ${who} — ${status}`;
+                });
+                fields.push({ name: tn, value: items.length ? items.join('\n').slice(0, 1024) : 'No reported injuries 👍' });
+            }
+            let desc = `_${lg.name}_`;
+            if (lg.sport === 'soccer') desc += '\n⚠️ Soccer injury data is limited — this report may be incomplete.';
+            if (!fields.length) desc += '\n\nNo injury report is posted for this game yet.';
+            const embed = new EmbedBuilder()
+                .setColor(0x00AE86)
+                .setTitle(`🩹 Injury Report — ${ev.name}`)
+                .setDescription(desc);
+            if (fields.length) embed.addFields(fields);
+            await interaction.editReply({ embeds: [embed] });
+        } catch (e) {
+            console.error('reports command error:', e);
+            await interaction.editReply('Something went wrong getting that report. Please try again in a moment.');
+        }
+    }
+
+    // ===== /watchprop — watch a player's live stat, DM the user as it climbs, #watchprop (or members chat) =====
+    if (commandName === 'watchprop') {
+        const norm = (interaction.channel?.name || '').toLowerCase().replace(/[^a-z]/g, '');
+        if (!norm.includes('watchprop') && !norm.includes('memberschat')) {
+            return interaction.reply({ content: '👀 The `/watchprop` command can be used in the #watchprop channel.', ephemeral: true });
+        }
+        const player = options.getString('player');
+        const statKey = options.getString('stat');
+        const target = options.getInteger('target');
+        const leagueKey = options.getString('league') || null;
+        await interaction.deferReply();
+        try {
+            const def = WATCH_STATS[statKey];
+            if (!def) return interaction.editReply('Please pick a stat from the list.');
+            const game = await findPlayerWatchGame(player, leagueKey, statKey);
+            if (!game) {
+                return interaction.editReply(
+                    `I couldn't find **${player}** in a live game right now.\n` +
+                    `• I can only start a watch once the game is **live** — that's when player stats show up.\n` +
+                    `• Live player tracking works for basketball games (NBA, WNBA, college).\n` +
+                    `• Try again right after tip-off, and pick the **league** to help me find it faster.`
+                );
+            }
+            const word = def.word;
+            const dup = await dbQuery(
+                `SELECT id FROM bot_watches WHERE user_id=$1 AND event_id=$2 AND lower(player_name)=lower($3) AND stat_key=$4 AND status='active'`,
+                [interaction.user.id, game.ev.id, game.player, statKey]
+            );
+            if (dup.rows.length) {
+                await dbQuery(`UPDATE bot_watches SET target_value=$1, updated_at=NOW() WHERE id=$2`, [target, dup.rows[0].id]);
+                return interaction.editReply(
+                    `✅ Updated your watch on **${game.player}** to **${target}+ ${word}** in **${game.ev.name}**.\n` +
+                    `They're at **${game.value} ${word}** right now. I'll keep DMing you as it moves.`
+                );
+            }
+            await dbQuery(
+                `INSERT INTO bot_watches (user_id, league_key, event_id, event_name, player_name, stat_key, target_value, last_value, last_notified_value, status)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$8,'active')
+                 ON CONFLICT (user_id, event_id, player_name, stat_key) WHERE status = 'active'
+                 DO UPDATE SET target_value = EXCLUDED.target_value, updated_at = NOW()`,
+                [interaction.user.id, game.lg.key, game.ev.id, game.ev.name, game.player, statKey, target, game.value]
+            );
+            await interaction.editReply(
+                `✅ Watching **${game.player}** for **${target}+ ${word}** in **${game.ev.name}** (${game.lg.name}).\n` +
+                `They're at **${game.value} ${word}** right now. I'll DM you as it climbs — make sure your DMs are open!`
+            );
+        } catch (e) {
+            console.error('watchprop command error:', e);
+            await interaction.editReply('Something went wrong setting up that watch. Please try again in a moment.');
+        }
+    }
 });
 
 // ====== STRIPE WEBHOOK SERVER ======
@@ -1171,203 +1507,7 @@ function publicUrl() {
 
 // Send the "Connect Discord" link by email via Brevo (free, no credit card)
 async function sendConnectEmail(toEmail, sessionId) {
-    if (!process.env.BREVO_API_KEY || !process.env.FROM_EMAIL) {
-        console.log('Brevo not configured (BREVO_API_KEY / FROM_EMAIL) — skipping email');
-        return;
-    }
-    const link = `${publicUrl()}/connect?session_id=${sessionId}`;
-    const html = `
-        <div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:24px">
-            <h2>Thanks for subscribing!</h2>
-            <p>Click the button below to connect your Discord account and unlock your access:</p>
-            <p style="text-align:center;margin:28px 0">
-                <a href="${link}" style="background:#5865F2;color:#fff;padding:14px 28px;border-radius:8px;text-decoration:none;font-weight:600">Connect Discord</a>
-            </p>
-            <p style="color:#666;font-size:13px">If the button doesn't work, copy and paste this link into your browser:<br>${link}</p>
-        </div>`;
-    const res = await fetch('https://api.brevo.com/v3/smtp/email', {
-        method: 'POST',
-        headers: {
-            'api-key': process.env.BREVO_API_KEY,
-            'Content-Type': 'application/json',
-            'Accept': 'application/json'
-        },
-        body: JSON.stringify({
-            sender: { email: process.env.FROM_EMAIL, name: '50fifty' },
-            to: [{ email: toEmail }],
-            subject: 'Connect your Discord to unlock access',
-            htmlContent: html
-        })
-    });
-    if (res.status >= 200 && res.status < 300) {
-        console.log(`Connect email sent to ${toEmail}`);
-    } else {
-        const txt = await res.text();
-        console.error(`Brevo error ${res.status}:`, txt);
-    }
-}
-function htmlPage(title, body) {
-    return `<!doctype html><html><head><meta charset="utf-8"><title>${title}</title>
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<style>
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0f1115;color:#fff;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;padding:20px}
-.card{background:#1a1d24;padding:40px;border-radius:12px;max-width:420px;width:100%;text-align:center;box-shadow:0 10px 40px rgba(0,0,0,.4)}
-h1{margin:0 0 12px;font-size:24px}
-p{color:#9aa3b2;line-height:1.5;margin:0 0 24px}
-a.btn{display:inline-block;background:#5865F2;color:#fff;padding:14px 28px;border-radius:8px;text-decoration:none;font-weight:600;font-size:16px}
-a.btn:hover{background:#4752c4}
-.success{color:#4ade80}
-.error{color:#f87171}
-</style></head><body><div class="card">${body}</div></body></html>`;
-}
+    if (!pro
+...
 
-app.get('/connect', async (req, res) => {
-    const sessionId = req.query.session_id;
-    if (!sessionId) {
-        // No session id (e.g. plain redirect from Stripe) — point them to their email
-        return res.send(htmlPage('Payment received', `
-            <h1 class="success">Payment received!</h1>
-            <p>Check your email for your personal <strong>Connect Discord</strong> link to unlock your access. It should arrive within a minute.</p>
-            <p style="font-size:13px;color:#9aa3b2">Don't see it? Check your spam folder.</p>
-        `));
-    }
-    try {
-        const row = await dbGetCheckoutSession(sessionId);
-        if (!row) {
-            return res.status(404).send(htmlPage('Not found', `<h1 class="error">Payment not found yet</h1><p>Your payment is still processing. Please refresh this page in 30 seconds.</p>`));
-        }
-        if (row.used) {
-            return res.status(409).send(htmlPage('Already used', `<h1 class="error">This link has already been used</h1><p>This access link can only be used once and has already connected a Discord account. If this wasn't you, contact support.</p>`));
-        }
-        const redirectUri = encodeURIComponent(`${publicUrl()}/oauth/callback`);
-        const clientId = process.env.DISCORD_CLIENT_ID;
-        const state = encodeURIComponent(sessionId);
-        const url = `https://discord.com/api/oauth2/authorize?client_id=${clientId}&redirect_uri=${redirectUri}&response_type=code&scope=identify%20guilds.join&state=${state}&prompt=consent`;
-        res.send(htmlPage('Connect Discord', `
-            <h1>Payment received!</h1>
-            <p>Click below to connect your Discord account and unlock your access.</p>
-            <a class="btn" href="${url}">Connect Discord</a>
-        `));
-    } catch (err) {
-        console.error('/connect error:', err.message);
-        res.status(500).send(htmlPage('Try again', `<h1 class="error">One moment</h1><p>We couldn't load your connect page just now. Please refresh this page in a few seconds.</p>`));
-    }
-});
-
-app.get('/oauth/callback', async (req, res) => {
-    const { code, state } = req.query;
-    if (!code || !state) {
-        return res.status(400).send(htmlPage('Error', `<h1 class="error">Missing code</h1><p>Something went wrong. Please try the connect link again.</p>`));
-    }
-    const sessionId = decodeURIComponent(state);
-
-    try {
-        const row = await dbGetCheckoutSession(sessionId);
-        if (!row) {
-            return res.status(404).send(htmlPage('Error', `<h1 class="error">Session expired</h1><p>Please use the link from your Stripe receipt again.</p>`));
-        }
-        if (row.used) {
-            return res.status(409).send(htmlPage('Already used', `<h1 class="error">This link has already been used</h1><p>This access link can only be used once and has already connected a Discord account.</p>`));
-        }
-
-        // Exchange code for access token
-        const tokenRes = await fetch('https://discord.com/api/oauth2/token', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-            body: new URLSearchParams({
-                client_id: process.env.DISCORD_CLIENT_ID,
-                client_secret: process.env.DISCORD_CLIENT_SECRET,
-                grant_type: 'authorization_code',
-                code,
-                redirect_uri: `${publicUrl()}/oauth/callback`
-            })
-        });
-        const tokenData = await tokenRes.json();
-        if (!tokenData.access_token) {
-            console.error('Token exchange failed:', tokenData);
-            return res.status(500).send(htmlPage('Error', `<h1 class="error">Connection failed</h1><p>Could not verify your Discord account. Please try again.</p>`));
-        }
-
-        // Get user info
-        const userRes = await fetch('https://discord.com/api/users/@me', {
-            headers: { Authorization: `Bearer ${tokenData.access_token}` }
-        });
-        const user = await userRes.json();
-        if (!user.id) {
-            console.error('User fetch failed:', user);
-            return res.status(500).send(htmlPage('Error', `<h1 class="error">Connection failed</h1><p>Could not read your Discord account.</p>`));
-        }
-
-        // Atomically claim the link so it can never be reused/shared
-        const customerId = await dbClaimCheckoutSession(sessionId);
-        if (!customerId) {
-            return res.status(409).send(htmlPage('Already used', `<h1 class="error">This link has already been used</h1><p>This access link can only be used once and has already connected a Discord account.</p>`));
-        }
-
-        // Add user to guild with PAID role (or update if already a member)
-        const guildId = process.env.DISCORD_GUILD_ID;
-        const roleId = process.env.DISCORD_ROLE_ID;
-        const addRes = await fetch(`https://discord.com/api/guilds/${guildId}/members/${user.id}`, {
-            method: 'PUT',
-            headers: {
-                Authorization: `Bot ${process.env.DISCORD_BOT_TOKEN}`,
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({
-                access_token: tokenData.access_token,
-                roles: [roleId]
-            })
-        });
-
-        if (addRes.status === 204) {
-            // Already in server — just add the role
-            await fetch(`https://discord.com/api/guilds/${guildId}/members/${user.id}/roles/${roleId}`, {
-                method: 'PUT',
-                headers: { Authorization: `Bot ${process.env.DISCORD_BOT_TOKEN}` }
-            });
-        } else if (!addRes.ok) {
-            const errText = await addRes.text();
-            console.error('Failed to add member:', addRes.status, errText);
-        }
-
-        await dbSaveSubscriber(customerId, user.id, user.username);
-        console.log(`Connected ${user.username} (${user.id}) to customer ${customerId}`);
-
-        res.send(htmlPage('Success', `
-            <h1 class="success">You're in!</h1>
-            <p>Your Discord account is connected and your PAID role is active. You can close this tab and open Discord.</p>
-        `));
-    } catch (err) {
-        console.error('OAuth callback error:', err);
-        res.status(500).send(htmlPage('Error', `<h1 class="error">Something went wrong</h1><p>Please try the connect link again.</p>`));
-    }
-});
-
-const BUILD_MARKER = 'linehistory-players-2026-06-13-1';
-app.get('/', (_req, res) => {
-    let betSlips = 'unknown';
-    try {
-        const g = client.guilds.cache.get(process.env.DISCORD_GUILD_ID);
-        if (!g) {
-            betSlips = 'guild-not-cached';
-        } else {
-            const ch = g.channels.cache.find(c => c.name && c.name.toLowerCase().replace(/[^a-z]/g, '').includes('betslips'));
-            betSlips = ch ? { id: ch.id, name: ch.name } : 'not-found';
-        }
-    } catch (e) {
-        betSlips = 'err:' + e.message;
-    }
-    res.json({
-        status: 'FiddyBot is running!',
-        build: BUILD_MARKER,
-        botReady: client.isReady(),
-        botTag: client.user ? client.user.tag : null,
-        betSlipsChannel: betSlips
-    });
-});
-
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, '0.0.0.0', () => console.log(`Webhook server listening on port ${PORT}`));
-
-// ====== LOGIN ======
-client.login(process.env.DISCORD_BOT_TOKEN);
+[Message clipped]  View entire message
