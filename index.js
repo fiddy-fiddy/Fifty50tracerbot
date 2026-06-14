@@ -1507,7 +1507,203 @@ function publicUrl() {
 
 // Send the "Connect Discord" link by email via Brevo (free, no credit card)
 async function sendConnectEmail(toEmail, sessionId) {
-    if (!pro
-...
+    if (!process.env.BREVO_API_KEY || !process.env.FROM_EMAIL) {
+        console.log('Brevo not configured (BREVO_API_KEY / FROM_EMAIL) — skipping email');
+        return;
+    }
+    const link = `${publicUrl()}/connect?session_id=${sessionId}`;
+    const html = `
+        <div style="font-family:sans-serif;max-width:480px;margin:0 auto;padding:24px">
+            <h2>Thanks for subscribing!</h2>
+            <p>Click the button below to connect your Discord account and unlock your access:</p>
+            <p style="text-align:center;margin:28px 0">
+                <a href="${link}" style="background:#5865F2;color:#fff;padding:14px 28px;border-radius:8px;text-decoration:none;font-weight:600">Connect Discord</a>
+            </p>
+            <p style="color:#666;font-size:13px">If the button doesn't work, copy and paste this link into your browser:<br>${link}</p>
+        </div>`;
+    const res = await fetch('https://api.brevo.com/v3/smtp/email', {
+        method: 'POST',
+        headers: {
+            'api-key': process.env.BREVO_API_KEY,
+            'Content-Type': 'application/json',
+            'Accept': 'application/json'
+        },
+        body: JSON.stringify({
+            sender: { email: process.env.FROM_EMAIL, name: '50fifty' },
+            to: [{ email: toEmail }],
+            subject: 'Connect your Discord to unlock access',
+            htmlContent: html
+        })
+    });
+    if (res.status >= 200 && res.status < 300) {
+        console.log(`Connect email sent to ${toEmail}`);
+    } else {
+        const txt = await res.text();
+        console.error(`Brevo error ${res.status}:`, txt);
+    }
+}
+function htmlPage(title, body) {
+    return `<!doctype html><html><head><meta charset="utf-8"><title>${title}</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#0f1115;color:#fff;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;padding:20px}
+.card{background:#1a1d24;padding:40px;border-radius:12px;max-width:420px;width:100%;text-align:center;box-shadow:0 10px 40px rgba(0,0,0,.4)}
+h1{margin:0 0 12px;font-size:24px}
+p{color:#9aa3b2;line-height:1.5;margin:0 0 24px}
+a.btn{display:inline-block;background:#5865F2;color:#fff;padding:14px 28px;border-radius:8px;text-decoration:none;font-weight:600;font-size:16px}
+a.btn:hover{background:#4752c4}
+.success{color:#4ade80}
+.error{color:#f87171}
+</style></head><body><div class="card">${body}</div></body></html>`;
+}
 
-[Message clipped]  View entire message
+app.get('/connect', async (req, res) => {
+    const sessionId = req.query.session_id;
+    if (!sessionId) {
+        // No session id (e.g. plain redirect from Stripe) — point them to their email
+        return res.send(htmlPage('Payment received', `
+            <h1 class="success">Payment received!</h1>
+            <p>Check your email for your personal <strong>Connect Discord</strong> link to unlock your access. It should arrive within a minute.</p>
+            <p style="font-size:13px;color:#9aa3b2">Don't see it? Check your spam folder.</p>
+        `));
+    }
+    try {
+        const row = await dbGetCheckoutSession(sessionId);
+        if (!row) {
+            return res.status(404).send(htmlPage('Not found', `<h1 class="error">Payment not found yet</h1><p>Your payment is still processing. Please refresh this page in 30 seconds.</p>`));
+        }
+        if (row.used) {
+            return res.status(409).send(htmlPage('Already used', `<h1 class="error">This link has already been used</h1><p>This access link can only be used once and has already connected a Discord account. If this wasn't you, contact support.</p>`));
+        }
+        const redirectUri = encodeURIComponent(`${publicUrl()}/oauth/callback`);
+        const clientId = process.env.DISCORD_CLIENT_ID;
+        const state = encodeURIComponent(sessionId);
+        const url = `https://discord.com/api/oauth2/authorize?client_id=${clientId}&redirect_uri=${redirectUri}&response_type=code&scope=identify%20guilds.join&state=${state}&prompt=consent`;
+        res.send(htmlPage('Connect Discord', `
+            <h1>Payment received!</h1>
+            <p>Click below to connect your Discord account and unlock your access.</p>
+            <a class="btn" href="${url}">Connect Discord</a>
+        `));
+    } catch (err) {
+        console.error('/connect error:', err.message);
+        res.status(500).send(htmlPage('Try again', `<h1 class="error">One moment</h1><p>We couldn't load your connect page just now. Please refresh this page in a few seconds.</p>`));
+    }
+});
+
+app.get('/oauth/callback', async (req, res) => {
+    const { code, state } = req.query;
+    if (!code || !state) {
+        return res.status(400).send(htmlPage('Error', `<h1 class="error">Missing code</h1><p>Something went wrong. Please try the connect link again.</p>`));
+    }
+    const sessionId = decodeURIComponent(state);
+
+    try {
+        const row = await dbGetCheckoutSession(sessionId);
+        if (!row) {
+            return res.status(404).send(htmlPage('Error', `<h1 class="error">Session expired</h1><p>Please use the link from your Stripe receipt again.</p>`));
+        }
+        if (row.used) {
+            return res.status(409).send(htmlPage('Already used', `<h1 class="error">This link has already been used</h1><p>This access link can only be used once and has already connected a Discord account.</p>`));
+        }
+
+        // Exchange code for access token
+        const tokenRes = await fetch('https://discord.com/api/oauth2/token', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: new URLSearchParams({
+                client_id: process.env.DISCORD_CLIENT_ID,
+                client_secret: process.env.DISCORD_CLIENT_SECRET,
+                grant_type: 'authorization_code',
+                code,
+                redirect_uri: `${publicUrl()}/oauth/callback`
+            })
+        });
+        const tokenData = await tokenRes.json();
+        if (!tokenData.access_token) {
+            console.error('Token exchange failed:', tokenData);
+            return res.status(500).send(htmlPage('Error', `<h1 class="error">Connection failed</h1><p>Could not verify your Discord account. Please try again.</p>`));
+        }
+
+        // Get user info
+        const userRes = await fetch('https://discord.com/api/users/@me', {
+            headers: { Authorization: `Bearer ${tokenData.access_token}` }
+        });
+        const user = await userRes.json();
+        if (!user.id) {
+            console.error('User fetch failed:', user);
+            return res.status(500).send(htmlPage('Error', `<h1 class="error">Connection failed</h1><p>Could not read your Discord account.</p>`));
+        }
+
+        // Atomically claim the link so it can never be reused/shared
+        const customerId = await dbClaimCheckoutSession(sessionId);
+        if (!customerId) {
+            return res.status(409).send(htmlPage('Already used', `<h1 class="error">This link has already been used</h1><p>This access link can only be used once and has already connected a Discord account.</p>`));
+        }
+
+        // Add user to guild with PAID role (or update if already a member)
+        const guildId = process.env.DISCORD_GUILD_ID;
+        const roleId = process.env.DISCORD_ROLE_ID;
+        const addRes = await fetch(`https://discord.com/api/guilds/${guildId}/members/${user.id}`, {
+            method: 'PUT',
+            headers: {
+                Authorization: `Bot ${process.env.DISCORD_BOT_TOKEN}`,
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                access_token: tokenData.access_token,
+                roles: [roleId]
+            })
+        });
+
+        if (addRes.status === 204) {
+            // Already in server — just add the role
+            await fetch(`https://discord.com/api/guilds/${guildId}/members/${user.id}/roles/${roleId}`, {
+                method: 'PUT',
+                headers: { Authorization: `Bot ${process.env.DISCORD_BOT_TOKEN}` }
+            });
+        } else if (!addRes.ok) {
+            const errText = await addRes.text();
+            console.error('Failed to add member:', addRes.status, errText);
+        }
+
+        await dbSaveSubscriber(customerId, user.id, user.username);
+        console.log(`Connected ${user.username} (${user.id}) to customer ${customerId}`);
+
+        res.send(htmlPage('Success', `
+            <h1 class="success">You're in!</h1>
+            <p>Your Discord account is connected and your PAID role is active. You can close this tab and open Discord.</p>
+        `));
+    } catch (err) {
+        console.error('OAuth callback error:', err);
+        res.status(500).send(htmlPage('Error', `<h1 class="error">Something went wrong</h1><p>Please try the connect link again.</p>`));
+    }
+});
+
+const BUILD_MARKER = 'espn-tools-2026-06-13-1';
+app.get('/', (_req, res) => {
+    let betSlips = 'unknown';
+    try {
+        const g = client.guilds.cache.get(process.env.DISCORD_GUILD_ID);
+        if (!g) {
+            betSlips = 'guild-not-cached';
+        } else {
+            const ch = g.channels.cache.find(c => c.name && c.name.toLowerCase().replace(/[^a-z]/g, '').includes('betslips'));
+            betSlips = ch ? { id: ch.id, name: ch.name } : 'not-found';
+        }
+    } catch (e) {
+        betSlips = 'err:' + e.message;
+    }
+    res.json({
+        status: 'FiddyBot is running!',
+        build: BUILD_MARKER,
+        botReady: client.isReady(),
+        botTag: client.user ? client.user.tag : null,
+        betSlipsChannel: betSlips
+    });
+});
+
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, '0.0.0.0', () => console.log(`Webhook server listening on port ${PORT}`));
+
+// ====== LOGIN ======
+client.login(process.env.DISCORD_BOT_TOKEN);
