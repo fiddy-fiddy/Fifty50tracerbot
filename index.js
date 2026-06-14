@@ -870,10 +870,12 @@ client.once('ready', async () => {
 
     try {
         console.log('Registering commands...');
-        await client.application.commands.set(data);
-        client.guilds.cache.forEach(async (guild) => {
+        // Register to each guild only (updates instantly). Clear GLOBAL commands so
+        // members don't see two copies of every command (one global + one guild).
+        await client.application.commands.set([]);
+        for (const guild of client.guilds.cache.values()) {
             await guild.commands.set(data);
-        });
+        }
         console.log('Slash commands registered!');
     } catch (error) {
         console.error('Error registering commands:', error);
@@ -953,6 +955,12 @@ function decodeEntities(str) {
 client.on('interactionCreate', async interaction => {
     if (!interaction.isChatInputCommand()) return;
     const { commandName, options, user } = interaction;
+
+    // The #watchprop channel is reserved for /watchprop only — block every other command there.
+    const chNorm = (interaction.channel?.name || '').toLowerCase().replace(/[^a-z]/g, '');
+    if (chNorm.includes('watchprop') && commandName !== 'watchprop') {
+        return interaction.reply({ content: '👀 Only the `/watchprop` command can be used in this channel.', ephemeral: true });
+    }
 
     if (commandName === 'follow') {
         const target = options.getUser('target');
@@ -1285,11 +1293,11 @@ client.on('interactionCreate', async interaction => {
         }
     }
 
-    // ===== /watchprop — watch a player's live stat, DM the user as it climbs, #watchprop (or members chat) =====
+    // ===== /watchprop — watch a player's live stat, DM the user as it climbs, #watchprop only =====
     if (commandName === 'watchprop') {
         const norm = (interaction.channel?.name || '').toLowerCase().replace(/[^a-z]/g, '');
-        if (!norm.includes('watchprop') && !norm.includes('memberschat')) {
-            return interaction.reply({ content: '👀 The `/watchprop` command can be used in the #watchprop channel.', ephemeral: true });
+        if (!norm.includes('watchprop')) {
+            return interaction.reply({ content: '👀 The `/watchprop` command can only be used in the #watchprop channel.', ephemeral: true });
         }
         const player = options.getString('player');
         const statKey = options.getString('stat');
@@ -1679,7 +1687,7 @@ app.get('/oauth/callback', async (req, res) => {
     }
 });
 
-const BUILD_MARKER = 'espn-tools-2026-06-13-1';
+const BUILD_MARKER = 'watchprop-only-channel-2026-06-14-2';
 app.get('/', (_req, res) => {
     let betSlips = 'unknown';
     try {
