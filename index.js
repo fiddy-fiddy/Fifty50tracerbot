@@ -1332,16 +1332,16 @@ client.on('interactionCreate', async interaction => {
         }
     }
 
-    // ===== /livescore — live score for any game, #tools (or members chat) =====
+    // ===== /livescore — live score for any game, #tools only =====
     if (commandName === 'livescore') {
         const norm = (interaction.channel?.name || '').toLowerCase().replace(/[^a-z]/g, '');
-        if (!norm.includes('tools') && !norm.includes('memberschat')) {
-            return interaction.reply({ content: '📺 The `/livescore` command can be used in the #tools channel.', ephemeral: true });
+        if (!norm.includes('tools')) {
+            return interaction.reply({ content: '📺 The `/livescore` command can only be used in the #tools channel.', ephemeral: true });
         }
         const team = options.getString('team');
         const leagueKey = options.getString('league') || null;
-        // In #tools, keep results private to each member; in members chat, show publicly.
-        await interaction.deferReply({ ephemeral: norm.includes('tools') });
+        // Replies are private to each member.
+        await interaction.deferReply({ ephemeral: true });
         try {
             const game = await findEspnGame(team, leagueKey);
             if (!game) {
@@ -1376,16 +1376,16 @@ client.on('interactionCreate', async interaction => {
         }
     }
 
-    // ===== /reports — injury report for a team's game, #tools (or members chat) =====
+    // ===== /reports — injury report for a team's game, #tools only =====
     if (commandName === 'reports') {
         const norm = (interaction.channel?.name || '').toLowerCase().replace(/[^a-z]/g, '');
-        if (!norm.includes('tools') && !norm.includes('memberschat')) {
-            return interaction.reply({ content: '🩹 The `/reports` command can be used in the #tools channel.', ephemeral: true });
+        if (!norm.includes('tools')) {
+            return interaction.reply({ content: '🩹 The `/reports` command can only be used in the #tools channel.', ephemeral: true });
         }
         const team = options.getString('team');
         const leagueKey = options.getString('league') || null;
-        // In #tools, keep results private to each member; in members chat, show publicly.
-        await interaction.deferReply({ ephemeral: norm.includes('tools') });
+        // Replies are private to each member.
+        await interaction.deferReply({ ephemeral: true });
         try {
             const game = await findEspnGame(team, leagueKey);
             if (!game) {
@@ -1931,7 +1931,7 @@ app.get('/oauth/callback', async (req, res) => {
     }
 });
 
-const BUILD_MARKER = 'stats-teams-2026-06-14-9';
+const BUILD_MARKER = 'tools-lockdown-2026-06-14-10';
 app.get('/', (_req, res) => {
     let betSlips = 'unknown';
     try {
