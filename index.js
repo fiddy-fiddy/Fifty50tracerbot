@@ -924,7 +924,7 @@ client.once('ready', async () => {
         { name: 'following', description: 'See who you are following', defaultMemberPermissions: ADMIN_ONLY },
         { name: 'feed', description: 'See recent slips from users you follow', defaultMemberPermissions: ADMIN_ONLY },
         { name: 'alerts', description: 'Turn DM alerts on or off', options: [{ name: 'state', type: 3, description: 'on or off', required: true }], defaultMemberPermissions: ADMIN_ONLY },
-        { name: 'stats', description: 'Look up sports stats (members chat only)', options: [{ name: 'question', type: 3, description: 'e.g. LeBron James points this season', required: true }] },
+        { name: 'stats', description: 'Look up player or team sports stats (members chat only)', options: [{ name: 'question', type: 3, description: 'e.g. LeBron points this season, or Lakers record this season', required: true }] },
         { name: 'linehistory', description: 'Show how a team or player\'s odds have moved (members chat only)', options: [
             { name: 'team', type: 3, description: 'Team OR player name — e.g. Lakers, Wembanyama, Salah', required: true },
             { name: 'league', type: 3, description: 'Optional: narrow the search to one league', required: false, choices: [
@@ -1152,7 +1152,7 @@ client.on('interactionCreate', async interaction => {
             // StatMuse returns a generic marketing blurb + banner when it has no real answer
             const noResult = !answer || /instant answers to your/i.test(answer) || (image && image.includes('sm-meta-banner'));
             if (noResult) {
-                return interaction.editReply(`Couldn't find stats for **${question}** — try rephrasing, e.g. \`/stats LeBron James points this season\`.`);
+                return interaction.editReply(`Couldn't find stats for **${question}** — try rephrasing. Works for players (\`/stats LeBron points this season\`) or teams (\`/stats Lakers record this season\`).`);
             }
             const embed = new EmbedBuilder()
                 .setColor(0x00AE86)
@@ -1429,7 +1429,7 @@ client.on('interactionCreate', async interaction => {
         if (!norm.includes('worldcup')) {
             return interaction.reply({ content: '⚽ The `/wcfixtures` command can be used in the #worldcup channel.', ephemeral: true });
         }
-        await interaction.deferReply();
+        await interaction.deferReply({ ephemeral: true });
         try {
             const events = await wcFixtures();
             if (!events.length) {
@@ -1464,7 +1464,7 @@ client.on('interactionCreate', async interaction => {
         if (!norm.includes('worldcup')) {
             return interaction.reply({ content: '⚽ The `/wcstandings` command can be used in the #worldcup channel.', ephemeral: true });
         }
-        await interaction.deferReply();
+        await interaction.deferReply({ ephemeral: true });
         try {
             const groups = await wcStandings();
             if (!groups.length) return interaction.editReply('Group standings aren\'t available yet.');
@@ -1497,7 +1497,7 @@ client.on('interactionCreate', async interaction => {
             return interaction.reply({ content: '⚽ The `/wcrecap` command can be used in the #worldcup channel.', ephemeral: true });
         }
         const team = options.getString('team');
-        await interaction.deferReply();
+        await interaction.deferReply({ ephemeral: true });
         try {
             const game = await wcFindRecentGame(team);
             if (!game) {
@@ -1931,7 +1931,7 @@ app.get('/oauth/callback', async (req, res) => {
     }
 });
 
-const BUILD_MARKER = 'worldcup-channel-2026-06-14-7';
+const BUILD_MARKER = 'stats-teams-2026-06-14-9';
 app.get('/', (_req, res) => {
     let betSlips = 'unknown';
     try {
