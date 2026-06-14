@@ -833,6 +833,75 @@ async function pollWatches() {
     }
 }
 
+// ===== WORLD CUP 2026 — TEMPORARY helpers (remove this whole block after the tournament) =====
+const WC_LEAGUE = espnLeague('wc'); // soccer / fifa.world
+const WC_WATCH_LINK = 'https://www.fifa.com/fifaplus/en/home'; // official & legal; broadcast rights vary by country
+
+// pull one standings stat as its display string (e.g. points, pointDifferential "+2")
+function wcStat(stats, name) {
+    const s = (stats || []).find(x => x.name === name);
+    return s ? String(s.displayValue != null ? s.displayValue : s.value) : '0';
+}
+
+// today's (UTC) World Cup fixtures; fall back to the current matchday board if today is empty
+async function wcFixtures() {
+    const ymd = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+    let events = [];
+    try { const d = await espnGet(`${ESPN_BASE}/soccer/fifa.world/scoreboard?dates=${ymd}`, 20000); events = (d && d.events) || []; } catch (e) {}
+    if (!events.length && WC_LEAGUE) { try { events = await espnScoreboard(WC_LEAGUE); } catch (e) {} }
+    return events;
+}
+
+// all World Cup group tables
+async function wcStandings() {
+    const d = await espnGet('https://site.api.espn.com/apis/v2/sports/soccer/fifa.world/standings', 60000);
+    return (d && d.children) || [];
+}
+
+// goals + cards (in match order) from a summary's keyEvents
+function wcMatchEvents(summary) {
+    const ke = (summary && summary.keyEvents) || [];
+    const keep = /goal|penalty|red card|yellow card/i;
+    const out = [];
+    for (const e of ke) {
+        const type = (e.type && (e.type.text || e.type.id)) || '';
+        if (!keep.test(type)) continue;
+        out.push({
+            type,
+            clock: (e.clock && e.clock.displayValue) || '',
+            team: (e.team && (e.team.displayName || e.team.abbreviation)) || '',
+            players: (e.participants || []).map(p => p.athlete && p.athlete.displayName).filter(Boolean)
+        });
+    }
+    return out;
+}
+// /wcrecap needs a team's LATEST match, which may be on an earlier matchday. The default
+// scoreboard only shows the current matchday, so scan recent dated boards (and tomorrow).
+async function wcFindRecentGame(query) {
+    if (!WC_LEAGUE) return null;
+    const ms = 86400000, now = Date.now();
+    const recapRank = ev => { const s = ev.status && ev.status.type && ev.status.type.state; return s === 'in' ? 0 : s === 'post' ? 1 : 2; };
+    let best = null;
+    for (let off = 1; off >= -10; off--) {
+        const ymd = new Date(now + off * ms).toISOString().slice(0, 10).replace(/-/g, '');
+        let events = [];
+        try { const d = await espnGet(`${ESPN_BASE}/soccer/fifa.world/scoreboard?dates=${ymd}`, 60000); events = (d && d.events) || []; } catch (e) { continue; }
+        for (const ev of events) {
+            const score = espnTeamScore(query, ev);
+            if (score < 80) continue;
+            const cand = { lg: WC_LEAGUE, ev, score, rank: recapRank(ev), when: Date.parse(ev.date) || 0 };
+            if (!best) { best = cand; continue; }
+            if (cand.score !== best.score) { if (cand.score > best.score) best = cand; }
+            else if (cand.rank !== best.rank) { if (cand.rank < best.rank) best = cand; }
+            else if (cand.rank === 2) { if (cand.when < best.when) best = cand; } // soonest upcoming
+            else { if (cand.when > best.when) best = cand; }                       // most recent live/finished
+        }
+        if (best && best.rank === 0) break; // a live match wins outright
+    }
+    return best;
+}
+// ===== end World Cup temporary helpers =====
+
 // ====== BOT READY & COMMAND REGISTRATION ======
 client.once('ready', async () => {
     console.log(`${client.user.tag} is online!`);
@@ -916,6 +985,11 @@ client.once('ready', async () => {
             { name: 'target', type: 4, description: 'Your number — e.g. 25', required: true, min_value: 1 },
             { name: 'league', type: 3, description: 'Optional: pick the league to find the game faster', required: false, choices: espnLeagueChoices }
         ] },
+        // ===== WORLD CUP 2026 — TEMPORARY commands (remove these 3 after the tournament) =====
+        { name: 'wcfixtures', description: 'World Cup: today\'s matches + kickoff times' },
+        { name: 'wcstandings', description: 'World Cup: group-stage tables' },
+        { name: 'wcrecap', description: 'World Cup: goals & cards for a team\'s latest match', options: [{ name: 'team', type: 3, description: 'Country — e.g. Brazil', required: true }] },
+        // ===== end World Cup temporary commands =====
         { name: 'parlay', description: 'Calculate parlay odds & payout (wins channel only)', options: [{ name: 'odds', type: 3, description: 'Odds per leg, e.g. +150 -110 +200', required: true }, { name: 'stake', type: 10, description: 'Amount you are betting (optional)', required: false }], defaultMemberPermissions: ADMIN_ONLY }
     ];
 
@@ -1349,6 +1423,119 @@ client.on('interactionCreate', async interaction => {
         }
     }
 
+    // ===== WORLD CUP 2026 — TEMPORARY handlers (remove this whole block after the tournament) =====
+    if (commandName === 'wcfixtures') {
+        const norm = (interaction.channel?.name || '').toLowerCase().replace(/[^a-z]/g, '');
+        if (!norm.includes('worldcup')) {
+            return interaction.reply({ content: '⚽ The `/wcfixtures` command can be used in the #worldcup channel.', ephemeral: true });
+        }
+        await interaction.deferReply();
+        try {
+            const events = await wcFixtures();
+            if (!events.length) {
+                return interaction.editReply('No World Cup matches are on the board right now. Try again tomorrow, or use `/livescore` for a specific team.');
+            }
+            const lines = events.map(ev => {
+                const sc = espnScoreLine(ev);
+                const st = (ev.status && ev.status.type) || {};
+                const epoch = Math.floor((Date.parse(ev.date) || 0) / 1000);
+                if (st.state === 'pre') return `🕐 <t:${epoch}:t> — ${sc.an} vs ${sc.hn}`;
+                if (st.state === 'in') {
+                    const clock = [ev.status && ev.status.displayClock, st.shortDetail].filter(Boolean).join(' · ');
+                    return `🔴 ${sc.line}  _(${clock || 'live'})_`;
+                }
+                return `✅ ${sc.line}  _(Final)_`;
+            });
+            const embed = new EmbedBuilder()
+                .setColor(0x6E33D6)
+                .setTitle('⚽ World Cup — Today\'s Matches')
+                .setDescription(lines.join('\n').slice(0, 4000))
+                .addFields({ name: 'Watch live (official)', value: `[FIFA+](${WC_WATCH_LINK}) — or your local rights-holder (US: FOX/Telemundo · UK: BBC/ITV)` })
+                .setFooter({ text: 'Kickoff times show in your local timezone · via ESPN' });
+            await interaction.editReply({ embeds: [embed] });
+        } catch (e) {
+            console.error('wcfixtures error:', e);
+            await interaction.editReply('Couldn\'t load the World Cup schedule right now. Please try again in a moment.');
+        }
+    }
+
+    if (commandName === 'wcstandings') {
+        const norm = (interaction.channel?.name || '').toLowerCase().replace(/[^a-z]/g, '');
+        if (!norm.includes('worldcup')) {
+            return interaction.reply({ content: '⚽ The `/wcstandings` command can be used in the #worldcup channel.', ephemeral: true });
+        }
+        await interaction.deferReply();
+        try {
+            const groups = await wcStandings();
+            if (!groups.length) return interaction.editReply('Group standings aren\'t available yet.');
+            const embed = new EmbedBuilder()
+                .setColor(0x6E33D6)
+                .setTitle('⚽ World Cup — Group Standings')
+                .setFooter({ text: 'Row: # Team  GP  W-D-L  GD  Pts · via ESPN' });
+            for (const g of groups) {
+                const entries = (g.standings && g.standings.entries) || [];
+                const rows = entries.map((en, i) => {
+                    const name = String((en.team && en.team.displayName) || '?').slice(0, 12).padEnd(12);
+                    const gp = wcStat(en.stats, 'gamesPlayed');
+                    const w = wcStat(en.stats, 'wins'), d = wcStat(en.stats, 'ties'), l = wcStat(en.stats, 'losses');
+                    const gd = wcStat(en.stats, 'pointDifferential');
+                    const pts = wcStat(en.stats, 'points');
+                    return `${i + 1} ${name} ${gp}  ${w}-${d}-${l}  ${gd.padStart(3)}  ${pts}p`;
+                });
+                embed.addFields({ name: g.name || 'Group', value: '```\n' + (rows.join('\n') || '—') + '\n```' });
+            }
+            await interaction.editReply({ embeds: [embed] });
+        } catch (e) {
+            console.error('wcstandings error:', e);
+            await interaction.editReply('Couldn\'t load the group standings right now. Please try again in a moment.');
+        }
+    }
+
+    if (commandName === 'wcrecap') {
+        const norm = (interaction.channel?.name || '').toLowerCase().replace(/[^a-z]/g, '');
+        if (!norm.includes('worldcup')) {
+            return interaction.reply({ content: '⚽ The `/wcrecap` command can be used in the #worldcup channel.', ephemeral: true });
+        }
+        const team = options.getString('team');
+        await interaction.deferReply();
+        try {
+            const game = await wcFindRecentGame(team);
+            if (!game) {
+                return interaction.editReply(`I couldn't find a World Cup match for **${team}**. Try the country name — e.g. \`Brazil\`, \`Morocco\`.`);
+            }
+            const summary = await espnSummary(game.lg, game.ev.id);
+            const sc = espnScoreLine(game.ev);
+            const st = (game.ev.status && game.ev.status.type) || {};
+            const epoch = Math.floor((Date.parse(game.ev.date) || 0) / 1000);
+            const head = st.state === 'pre' ? `🗓️ Kicks off <t:${epoch}:F>`
+                : st.state === 'in' ? `🔴 LIVE — ${sc.line}`
+                : `✅ Final — ${sc.line}`;
+            const evs = wcMatchEvents(summary);
+            const icon = t => /own goal/i.test(t) ? '⚽(OG)'
+                : /penalty/i.test(t) ? (/scored/i.test(t) ? '⚽(pen)' : '❌(pen)')
+                : /goal/i.test(t) ? '⚽'
+                : /red/i.test(t) ? '🟥' : '🟨';
+            const body = evs.length ? evs.map(e => {
+                let who = e.players.join(', ');
+                if (/^goal$/i.test(e.type) && e.players.length > 1) {
+                    who = `${e.players[0]} (assist: ${e.players.slice(1).join(', ')})`;
+                }
+                const min = (e.clock || '').padStart(4);
+                return `\`${min}\` ${icon(e.type)} ${who || e.team}${who && e.team ? ` _(${e.team})_` : ''}`;
+            }).join('\n') : 'No goals or cards in this match yet.';
+            const embed = new EmbedBuilder()
+                .setColor(0x6E33D6)
+                .setTitle(`⚽ ${game.ev.name}`)
+                .setDescription(`${head}\n\n${body}`.slice(0, 4000))
+                .setFooter({ text: 'Goals & cards via ESPN' });
+            await interaction.editReply({ embeds: [embed] });
+        } catch (e) {
+            console.error('wcrecap error:', e);
+            await interaction.editReply('Couldn\'t build that match recap right now. Please try again in a moment.');
+        }
+    }
+    // ===== end World Cup temporary handlers =====
+
     // ===== /watchprop — watch a player's live stat, DM the user as it climbs, #watchprop only =====
     if (commandName === 'watchprop') {
         const norm = (interaction.channel?.name || '').toLowerCase().replace(/[^a-z]/g, '');
@@ -1744,7 +1931,7 @@ app.get('/oauth/callback', async (req, res) => {
     }
 });
 
-const BUILD_MARKER = 'watchprop-multisport-2026-06-14-5';
+const BUILD_MARKER = 'worldcup-channel-2026-06-14-7';
 app.get('/', (_req, res) => {
     let betSlips = 'unknown';
     try {
