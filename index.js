@@ -658,14 +658,32 @@ function espnScoreLine(ev) {
     return { an, hn, aScore, hScore, line: `${an} **${aScore}**  —  **${hScore}** ${hn}` };
 }
 
-// ---- /watchprop: live player-prop tracking (basketball is where ESPN posts live box scores) ----
+// ---- /watchprop: live player-prop tracking ----
+// ESPN posts live per-player box scores for basketball, baseball, and hockey (NOT soccer).
+// Each stat carries its sport so we only search that sport's leagues. Baseball reuses the same
+// labels (K/H/HR) in the batting vs pitching sections, so those read by stable `keys` scoped to
+// a `group`. Hockey keys are unique across forwards/defenses/goalies, so no group is needed.
 const WATCH_STATS = {
-    points:   { word: 'points',     labels: ['PTS'] },
-    rebounds: { word: 'rebounds',   labels: ['REB'] },
-    assists:  { word: 'assists',    labels: ['AST'] },
-    threes:   { word: '3-pointers', labels: ['3PT', '3P'], madeAtt: true },
-    steals:   { word: 'steals',     labels: ['STL'] },
-    blocks:   { word: 'blocks',     labels: ['BLK'] }
+    // basketball (NBA / WNBA / college)
+    points:   { sport: 'basketball', word: 'points',     labels: ['PTS'] },
+    rebounds: { sport: 'basketball', word: 'rebounds',   labels: ['REB'] },
+    assists:  { sport: 'basketball', word: 'assists',    labels: ['AST'] },
+    threes:   { sport: 'basketball', word: '3-pointers', labels: ['3PT', '3P'], madeAtt: true },
+    steals:   { sport: 'basketball', word: 'steals',     labels: ['STL'] },
+    blocks:   { sport: 'basketball', word: 'blocks',     labels: ['BLK'] },
+    // baseball (MLB) — batting props
+    homeruns: { sport: 'baseball', word: 'home runs', group: 'batting',  keys: ['homeRuns'] },
+    hits:     { sport: 'baseball', word: 'hits',      group: 'batting',  keys: ['hits'] },
+    rbis:     { sport: 'baseball', word: 'RBIs',      group: 'batting',  keys: ['RBIs'] },
+    runs:     { sport: 'baseball', word: 'runs',      group: 'batting',  keys: ['runs'] },
+    // baseball (MLB) — pitching prop
+    strikeouts: { sport: 'baseball', word: 'strikeouts', group: 'pitching', keys: ['strikeouts'] },
+    // hockey (NHL)
+    goals:     { sport: 'hockey', word: 'goals',         keys: ['goals'] },
+    hkassists: { sport: 'hockey', word: 'assists',       keys: ['assists'] },
+    shots:     { sport: 'hockey', word: 'shots on goal', keys: ['shotsTotal'] },
+    hkhits:    { sport: 'hockey', word: 'hits',          keys: ['hits'] },
+    saves:     { sport: 'hockey', word: 'saves',         keys: ['saves'] }
 };
 
 // turn a raw box-score cell into a number; for "made-attempted" cells (e.g. 3PT "2-5") take the made count
@@ -677,18 +695,28 @@ function parseStatNumber(raw, madeAtt) {
     return Number.isNaN(n) ? null : n;
 }
 
-// find a player's current value for a stat inside a game summary's box score
+// find a player's current value for a stat inside a game summary's box score.
+// Matches by stable `keys` when provided (baseball/hockey), else by `labels` (basketball).
+// `group` (string or array) restricts which box-score section to read — needed for baseball,
+// where batting and pitching share labels like K/H/HR.
 function readPlayerStat(summary, playerQuery, statKey) {
     const def = WATCH_STATS[statKey];
     if (!def) return null;
+    const groupFilter = def.group ? [].concat(def.group) : null;
     const teams = (summary.boxscore && summary.boxscore.players) || [];
     let best = null;
     for (const tp of teams) {
         const teamName = tp.team && tp.team.displayName;
         for (const grp of (tp.statistics || [])) {
-            const labels = grp.labels || [];
+            const gname = grp.name || grp.type;
+            if (groupFilter && !groupFilter.includes(gname)) continue;
             let idx = -1;
-            for (const L of def.labels) { const i = labels.indexOf(L); if (i >= 0) { idx = i; break; } }
+            if (def.keys && grp.keys) {
+                for (const k of def.keys) { const i = grp.keys.indexOf(k); if (i >= 0) { idx = i; break; } }
+            }
+            if (idx < 0 && def.labels && grp.labels) {
+                for (const L of def.labels) { const i = grp.labels.indexOf(L); if (i >= 0) { idx = i; break; } }
+            }
             if (idx < 0) continue;
             for (const a of (grp.athletes || [])) {
                 const name = a.athlete && a.athlete.displayName;
@@ -709,9 +737,22 @@ function summaryState(summary) {
     return (comp && comp.status && comp.status.type && comp.status.type.state) || null;
 }
 
+// which ESPN leagues can serve a given stat (by sport); narrow to one league if the user picked
+// a matching one, otherwise scan all leagues of that sport.
+function leaguesForStat(statKey, leagueKey) {
+    const def = WATCH_STATS[statKey];
+    const sport = def && def.sport;
+    const inSport = ESPN_LEAGUES.filter(l => l.sport === sport);
+    if (leagueKey) {
+        const picked = espnLeague(leagueKey);
+        if (picked && picked.sport === sport) return [picked];
+    }
+    return inSport;
+}
+
 // find a LIVE game that currently shows this player in its box score
 async function findPlayerWatchGame(playerQuery, leagueKey, statKey) {
-    const leagues = leagueKey ? [espnLeague(leagueKey)].filter(Boolean) : ESPN_LEAGUES;
+    const leagues = leaguesForStat(statKey, leagueKey);
     let best = null;
     for (const lg of leagues) {
         let events;
@@ -854,13 +895,23 @@ client.once('ready', async () => {
         ] },
         { name: 'watchprop', description: 'Watch a player\'s live stat and get DMs as it climbs', options: [
             { name: 'player', type: 3, description: 'Player name — e.g. LeBron James', required: true },
-            { name: 'stat', type: 3, description: 'Which stat to watch', required: true, choices: [
-                { name: 'Points', value: 'points' },
-                { name: 'Rebounds', value: 'rebounds' },
-                { name: 'Assists', value: 'assists' },
-                { name: '3-Pointers', value: 'threes' },
-                { name: 'Steals', value: 'steals' },
-                { name: 'Blocks', value: 'blocks' }
+            { name: 'stat', type: 3, description: 'Which stat to watch (basketball, baseball, or hockey)', required: true, choices: [
+                { name: '🏀 Points', value: 'points' },
+                { name: '🏀 Rebounds', value: 'rebounds' },
+                { name: '🏀 Assists', value: 'assists' },
+                { name: '🏀 3-Pointers', value: 'threes' },
+                { name: '🏀 Steals', value: 'steals' },
+                { name: '🏀 Blocks', value: 'blocks' },
+                { name: '⚾ Home Runs', value: 'homeruns' },
+                { name: '⚾ Hits', value: 'hits' },
+                { name: '⚾ RBIs', value: 'rbis' },
+                { name: '⚾ Runs', value: 'runs' },
+                { name: '⚾ Strikeouts (pitcher)', value: 'strikeouts' },
+                { name: '🏒 Goals', value: 'goals' },
+                { name: '🏒 Assists', value: 'hkassists' },
+                { name: '🏒 Shots on Goal', value: 'shots' },
+                { name: '🏒 Hits', value: 'hkhits' },
+                { name: '🏒 Saves (goalie)', value: 'saves' }
             ] },
             { name: 'target', type: 4, description: 'Your number — e.g. 25', required: true, min_value: 1 },
             { name: 'league', type: 3, description: 'Optional: pick the league to find the game faster', required: false, choices: espnLeagueChoices }
@@ -1281,8 +1332,11 @@ client.on('interactionCreate', async interaction => {
                 fields.push({ name: tn, value: items.length ? items.join('\n').slice(0, 1024) : 'No reported injuries 👍' });
             }
             let desc = `_${lg.name}_`;
-            if (lg.sport === 'soccer') desc += '\n⚠️ Soccer injury data is limited — this report may be incomplete.';
-            if (!fields.length) desc += '\n\nNo injury report is posted for this game yet.';
+            if (lg.sport === 'soccer') {
+                desc += '\n\nℹ️ ESPN doesn\'t publish injury reports for soccer (including the World Cup), so `/reports` only has data for **NBA, NFL, MLB, and NHL** games.';
+            } else if (!fields.length) {
+                desc += '\n\nNo injury report is posted for this game yet.';
+            }
             const embed = new EmbedBuilder()
                 .setColor(0x00AE86)
                 .setTitle(`🩹 Injury Report — ${ev.name}`)
@@ -1315,8 +1369,8 @@ client.on('interactionCreate', async interaction => {
                 return interaction.editReply(
                     `I couldn't find **${player}** in a live game right now.\n` +
                     `• I can only start a watch once the game is **live** — that's when player stats show up.\n` +
-                    `• Live player tracking works for basketball games (NBA, WNBA, college).\n` +
-                    `• Try again right after tip-off, and pick the **league** to help me find it faster.`
+                    `• Live player tracking works for basketball (NBA, WNBA, college), baseball (MLB), and hockey (NHL).\n` +
+                    `• Try again once the game has started, and pick the **league** to help me find it faster.`
                 );
             }
             const word = def.word;
@@ -1690,7 +1744,7 @@ app.get('/oauth/callback', async (req, res) => {
     }
 });
 
-const BUILD_MARKER = 'ephemeral-tools-watchprop-2026-06-14-3';
+const BUILD_MARKER = 'watchprop-multisport-2026-06-14-5';
 app.get('/', (_req, res) => {
     let betSlips = 'unknown';
     try {
