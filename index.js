@@ -645,6 +645,53 @@ async function findEspnGame(query, leagueKey) {
     return best;
 }
 
+// ---- /news: resolve a team season-independently (works off-season, not just on today's board), then pull its latest ESPN headlines ----
+async function espnTeamList(lg) {
+    try {
+        const d = await espnGet(`${ESPN_BASE}/${lg.sport}/${lg.league}/teams`, 6 * 60 * 60 * 1000);
+        const leagues = (((d || {}).sports || [])[0] || {}).leagues || [];
+        const teams = (leagues[0] && leagues[0].teams) || [];
+        return teams.map(t => t.team).filter(Boolean);
+    } catch (e) { return []; }
+}
+function espnTeamNameScore(query, t) {
+    const q = normTeam(query);
+    if (!q) return 0;
+    const cands = [t.displayName, t.shortDisplayName, t.name, t.location, t.nickname, t.abbreviation]
+        .filter(Boolean).map(normTeam);
+    let best = 0;
+    for (const cand of cands) {
+        if (!cand) continue;
+        if (cand === q) best = Math.max(best, 100);
+        else if (cand.split(' ').includes(q)) best = Math.max(best, 88);
+        else if (cand.includes(q) || q.includes(cand)) best = Math.max(best, 80);
+    }
+    return best;
+}
+async function findEspnTeam(query, leagueKey) {
+    const leagues = leagueKey ? [espnLeague(leagueKey)].filter(Boolean) : ESPN_LEAGUES;
+    let best = null;
+    for (const lg of leagues) {
+        const teams = await espnTeamList(lg);
+        for (const t of teams) {
+            const score = espnTeamNameScore(query, t);
+            if (score < 80) continue;
+            if (!best || score > best.score) best = { lg, team: t, score };
+        }
+        if (best && best.score >= 100) break; // exact name hit — stop scanning
+    }
+    return best;
+}
+async function espnTeamNews(lg, teamId) {
+    // let a fetch failure propagate so the handler shows a real error instead of a misleading "no headlines"
+    const d = await espnGet(`${ESPN_BASE}/${lg.sport}/${lg.league}/news?limit=50`, 5 * 60 * 1000);
+    const articles = (d && d.articles) || [];
+    const tid = String(teamId);
+    const mine = articles.filter(a => (a.categories || []).some(c => c.type === 'team' && String(c.teamId || (c.team && c.team.id)) === tid));
+    mine.sort((a, b) => (Date.parse(b.published) || 0) - (Date.parse(a.published) || 0));
+    return mine;
+}
+
 // pull both teams' scores into a readable line
 function espnScoreLine(ev) {
     const comp = (ev.competitions && ev.competitions[0]) || {};
@@ -962,6 +1009,10 @@ client.once('ready', async () => {
             { name: 'team', type: 3, description: 'Team or city — e.g. Knicks, Chiefs', required: true },
             { name: 'league', type: 3, description: 'Optional: pick the league to search faster', required: false, choices: espnLeagueChoices }
         ] },
+        { name: 'news', description: 'Latest news, headlines & trades for a team', options: [
+            { name: 'team', type: 3, description: 'Team or city — e.g. Lakers, Yankees, Chiefs', required: true },
+            { name: 'league', type: 3, description: 'Optional: pick the league to search faster', required: false, choices: espnLeagueChoices }
+        ] },
         { name: 'watchprop', description: 'Watch a player\'s live stat and get DMs as it climbs', options: [
             { name: 'player', type: 3, description: 'Player name — e.g. LeBron James', required: true },
             { name: 'stat', type: 3, description: 'Which stat to watch (basketball, baseball, or hockey)', required: true, choices: [
@@ -1133,14 +1184,14 @@ client.on('interactionCreate', async interaction => {
         await interaction.reply(`DM alerts turned **${toggle.toUpperCase()}**`);
     }
 
-    // ===== /stats — StatMuse lookup, MEMBERS CHAT ONLY, public =====
+    // ===== /stats — StatMuse lookup, members chat or #tools =====
     if (commandName === 'stats') {
         const norm = (interaction.channel?.name || '').toLowerCase().replace(/[^a-z]/g, '');
-        if (!norm.includes('memberschat')) {
-            return interaction.reply({ content: '📊 The `/stats` command can only be used in the members chat.', ephemeral: true });
+        if (!norm.includes('memberschat') && !norm.includes('tools')) {
+            return interaction.reply({ content: '📊 The `/stats` command can be used in the members chat or #tools.', ephemeral: true });
         }
         const question = options.getString('question');
-        await interaction.deferReply();
+        await interaction.deferReply({ ephemeral: norm.includes('tools') });
         try {
             const url = `https://www.statmuse.com/ask?q=${encodeURIComponent(question)}`;
             const resp = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36' } });
@@ -1211,16 +1262,16 @@ client.on('interactionCreate', async interaction => {
         await interaction.reply({ embeds: [embed] });
     }
 
-    // ===== /linehistory — line movement graph, MEMBERS CHAT ONLY, public =====
+    // ===== /linehistory — line movement graph, members chat or #tools =====
     if (commandName === 'linehistory') {
         const norm = (interaction.channel?.name || '').toLowerCase().replace(/[^a-z]/g, '');
-        if (!norm.includes('memberschat')) {
-            return interaction.reply({ content: '📈 The `/linehistory` command can only be used in the members chat.', ephemeral: true });
+        if (!norm.includes('memberschat') && !norm.includes('tools')) {
+            return interaction.reply({ content: '📈 The `/linehistory` command can be used in the members chat or #tools.', ephemeral: true });
         }
         const teamQuery = options.getString('team');
         const leagueKey = options.getString('league') || null;
         const statKey = options.getString('stat') || null;
-        await interaction.deferReply();
+        await interaction.deferReply({ ephemeral: norm.includes('tools') });
         try {
             // Work out WHAT to chart:
             //  • a stat was picked  -> look up that player prop directly
@@ -1420,6 +1471,47 @@ client.on('interactionCreate', async interaction => {
         } catch (e) {
             console.error('reports command error:', e);
             await interaction.editReply('Something went wrong getting that report. Please try again in a moment.');
+        }
+    }
+
+    // ===== /news — latest team headlines/trades via ESPN, members chat or #tools =====
+    if (commandName === 'news') {
+        const norm = (interaction.channel?.name || '').toLowerCase().replace(/[^a-z]/g, '');
+        if (!norm.includes('memberschat') && !norm.includes('tools')) {
+            return interaction.reply({ content: '📰 The `/news` command can be used in the members chat or #tools.', ephemeral: true });
+        }
+        const teamQuery = options.getString('team');
+        const leagueKey = options.getString('league') || null;
+        await interaction.deferReply({ ephemeral: norm.includes('tools') });
+        try {
+            const match = await findEspnTeam(teamQuery, leagueKey);
+            if (!match) {
+                return interaction.editReply(`I couldn't find a team called **${teamQuery}**. Try the team name or city — e.g. \`Lakers\`, \`Yankees\`, \`Chiefs\` — or pick a **league** from the list.`);
+            }
+            const { lg, team } = match;
+            const articles = await espnTeamNews(lg, team.id);
+            if (!articles.length) {
+                return interaction.editReply(`No recent headlines for **${team.displayName}** right now. Check back later, or try a **league** filter.`);
+            }
+            const lines = articles.slice(0, 6).map(a => {
+                const epoch = Math.floor((Date.parse(a.published) || 0) / 1000);
+                const when = epoch ? ` · <t:${epoch}:R>` : '';
+                const tag = (a.type && a.type !== 'Story' && a.type !== 'HeadlineNews') ? `**[${a.type}]** ` : '';
+                const href = a.links && a.links.web && a.links.web.href;
+                const title = href ? `[${a.headline}](${href})` : a.headline;
+                return `• ${tag}${title}${when}`;
+            });
+            const embed = new EmbedBuilder()
+                .setColor(0x00AE86)
+                .setTitle(`📰 ${team.displayName} — Latest News`)
+                .setDescription(lines.join('\n').slice(0, 4000))
+                .setFooter({ text: `${lg.name} · headlines via ESPN · tap a headline to read` });
+            const logo = team.logos && team.logos[0] && team.logos[0].href;
+            if (logo) embed.setThumbnail(logo);
+            await interaction.editReply({ embeds: [embed] });
+        } catch (e) {
+            console.error('news command error:', e);
+            await interaction.editReply('Couldn\'t load news right now. Please try again in a moment.');
         }
     }
 
@@ -1931,7 +2023,7 @@ app.get('/oauth/callback', async (req, res) => {
     }
 });
 
-const BUILD_MARKER = 'tools-lockdown-2026-06-14-10';
+const BUILD_MARKER = 'news-cmd-2026-06-14-12';
 app.get('/', (_req, res) => {
     let betSlips = 'unknown';
     try {
