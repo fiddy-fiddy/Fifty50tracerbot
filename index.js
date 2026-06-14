@@ -1215,7 +1215,8 @@ client.on('interactionCreate', async interaction => {
         }
         const team = options.getString('team');
         const leagueKey = options.getString('league') || null;
-        await interaction.deferReply();
+        // In #tools, keep results private to each member; in members chat, show publicly.
+        await interaction.deferReply({ ephemeral: norm.includes('tools') });
         try {
             const game = await findEspnGame(team, leagueKey);
             if (!game) {
@@ -1258,7 +1259,8 @@ client.on('interactionCreate', async interaction => {
         }
         const team = options.getString('team');
         const leagueKey = options.getString('league') || null;
-        await interaction.deferReply();
+        // In #tools, keep results private to each member; in members chat, show publicly.
+        await interaction.deferReply({ ephemeral: norm.includes('tools') });
         try {
             const game = await findEspnGame(team, leagueKey);
             if (!game) {
@@ -1303,7 +1305,8 @@ client.on('interactionCreate', async interaction => {
         const statKey = options.getString('stat');
         const target = options.getInteger('target');
         const leagueKey = options.getString('league') || null;
-        await interaction.deferReply();
+        // Always private — only the member who set the watch sees this confirmation.
+        await interaction.deferReply({ ephemeral: true });
         try {
             const def = WATCH_STATS[statKey];
             if (!def) return interaction.editReply('Please pick a stat from the list.');
@@ -1687,7 +1690,7 @@ app.get('/oauth/callback', async (req, res) => {
     }
 });
 
-const BUILD_MARKER = 'watchprop-only-channel-2026-06-14-2';
+const BUILD_MARKER = 'ephemeral-tools-watchprop-2026-06-14-3';
 app.get('/', (_req, res) => {
     let betSlips = 'unknown';
     try {
