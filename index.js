@@ -7,7 +7,7 @@
 //   DATABASE_URL (Neon Postgres), PORT (Railway sets this)
 //   BREVO_API_KEY, FROM_EMAIL (for emailing the connect link after payment)
 
-const { Client, GatewayIntentBits, Partials, PermissionFlagsBits, EmbedBuilder } = require('discord.js');
+const { Client, GatewayIntentBits, Partials, PermissionFlagsBits, EmbedBuilder, ActionRowBuilder, StringSelectMenuBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
 const fs = require('fs');
 const express = require('express');
 const Stripe = require('stripe');
@@ -72,6 +72,27 @@ async function initDb() {
         );
         CREATE INDEX IF NOT EXISTS bot_watches_active_idx ON bot_watches (status, event_id);
         CREATE UNIQUE INDEX IF NOT EXISTS bot_watches_unique_active ON bot_watches (user_id, event_id, player_name, stat_key) WHERE status = 'active';
+        CREATE TABLE IF NOT EXISTS bot_goal_watches (
+            id SERIAL PRIMARY KEY,
+            user_id TEXT NOT NULL,
+            channel_id TEXT NOT NULL,
+            event_id TEXT NOT NULL,
+            event_name TEXT,
+            league_key TEXT DEFAULT 'wc',
+            last_goal_count INTEGER DEFAULT 0,
+            last_home INTEGER,
+            last_away INTEGER,
+            last_period INTEGER,
+            status TEXT DEFAULT 'active',
+            created_at TIMESTAMPTZ DEFAULT NOW(),
+            updated_at TIMESTAMPTZ DEFAULT NOW()
+        );
+        CREATE INDEX IF NOT EXISTS bot_goal_watches_active_idx ON bot_goal_watches (status, event_id);
+        CREATE UNIQUE INDEX IF NOT EXISTS bot_goal_watches_unique_active ON bot_goal_watches (user_id, event_id) WHERE status = 'active';
+        ALTER TABLE bot_goal_watches ADD COLUMN IF NOT EXISTS league_key TEXT DEFAULT 'wc';
+        ALTER TABLE bot_goal_watches ADD COLUMN IF NOT EXISTS last_home INTEGER;
+        ALTER TABLE bot_goal_watches ADD COLUMN IF NOT EXISTS last_away INTEGER;
+        ALTER TABLE bot_goal_watches ADD COLUMN IF NOT EXISTS last_period INTEGER;
     `);
     console.log('Database tables ready.');
 }
@@ -880,6 +901,280 @@ async function pollWatches() {
     }
 }
 
+// ---- /updates: World Cup live goal alerts (posted in-channel with @mention so they push to phones) ----
+function wcGoalPlays(summary) {
+    return (((summary || {}).keyEvents) || []).filter(k => k && k.scoringPlay);
+}
+function wcSummaryScoreLine(summary) {
+    const comp = ((((summary || {}).header || {}).competitions) || [])[0] || {};
+    const cs = comp.competitors || [];
+    const home = cs.find(c => c.homeAway === 'home') || cs[0] || {};
+    const away = cs.find(c => c.homeAway === 'away') || cs[1] || {};
+    const hn = (home.team && home.team.displayName) || 'Home';
+    const an = (away.team && away.team.displayName) || 'Away';
+    const hs = home.score != null ? home.score : '-';
+    const as = away.score != null ? away.score : '-';
+    return `${an} **${as} — ${hs}** ${hn}`;
+}
+function wcGoalText(play) {
+    const minute = (play.clock && play.clock.displayValue) ? `${play.clock.displayValue} ` : '';
+    const team = (play.team && play.team.displayName) || '';
+    const parts = (play.participants || []).map(p => p.athlete && p.athlete.displayName).filter(Boolean);
+    const scorer = parts[0] || 'Goal';
+    const assist = parts[1];
+    const kind = (play.type && play.type.text) || 'Goal';
+    let head;
+    if (/own goal/i.test(kind)) head = `⚽ ${minute}**OWN GOAL — ${team}**`;
+    else if (/penalty/i.test(kind)) head = `⚽ ${minute}**GOAL (Penalty) — ${team}**`;
+    else head = `⚽ ${minute}**GOAL — ${team}**`;
+    let body = `**${scorer}**`;
+    if (assist) body += `  ·  assist: **${assist}**`;
+    return `${head}\n${body}`;
+}
+function wcStopRow(eventId) {
+    return new ActionRowBuilder().addComponents(
+        new ButtonBuilder().setCustomId(`wcstop:${eventId}`).setLabel('Stop alerts').setStyle(ButtonStyle.Secondary).setEmoji('🔕')
+    );
+}
+
+// ---- multi-sport score alerts (powers /updates in the #tools channel) ----
+const SPORT_EMOJI = { soccer: '⚽', basketball: '🏀', baseball: '⚾', football: '🏈', hockey: '🏒' };
+
+// current scores + team names from any ESPN game summary (header is the same shape across sports)
+function summaryScores(summary) {
+    const comp = ((((summary || {}).header || {}).competitions) || [])[0] || {};
+    const cs = comp.competitors || [];
+    const home = cs.find(c => c.homeAway === 'home') || cs[0] || {};
+    const away = cs.find(c => c.homeAway === 'away') || cs[1] || {};
+    const hs = parseInt(home.score, 10);
+    const as = parseInt(away.score, 10);
+    return {
+        home: Number.isNaN(hs) ? 0 : hs,
+        away: Number.isNaN(as) ? 0 : as,
+        hn: (home.team && home.team.displayName) || 'Home',
+        an: (away.team && away.team.displayName) || 'Away'
+    };
+}
+function summaryMatchName(summary) {
+    const s = summaryScores(summary);
+    return `${s.an} vs ${s.hn}`;
+}
+function gameStatusText(summary) {
+    const comp = ((((summary || {}).header || {}).competitions) || [])[0] || {};
+    const t = (comp.status && comp.status.type) || {};
+    return t.shortDetail || t.detail || 'live';
+}
+function quarterLabel(doneQuarter) {
+    if (doneQuarter <= 0) return 'Quarter update';
+    if (doneQuarter <= 3) return `End of Q${doneQuarter}`;
+    if (doneQuarter === 4) return 'End of regulation';
+    return `End of OT${doneQuarter - 4}`;
+}
+
+// today's games across every configured league (parallel; espnScoreboard is cached so ESPN stays happy)
+async function todaysGamesAllSports() {
+    const lists = await Promise.all(ESPN_LEAGUES.map(async lg => {
+        try { return (await espnScoreboard(lg)).map(ev => ({ lg, ev })); } catch (e) { return []; }
+    }));
+    return lists.flat();
+}
+
+// fetch one game's summary and route it to the right alert style for its sport
+async function processGoalWatchGroup(watches) {
+    const channelId = watches[0].channel_id;
+    const eventId = watches[0].event_id;
+    const eventName = watches[0].event_name || 'Game';
+    const lg = espnLeague(watches[0].league_key || 'wc');
+    if (!lg) return;
+    let summary;
+    try { summary = await espnSummary(lg, eventId); } catch (e) { return; }
+    const state = summaryState(summary);
+    let channel = null;
+    try { channel = await client.channels.fetch(channelId); } catch (e) { channel = null; }
+
+    // game over: one final/full-time line, then close out the watches so nobody gets re-pinged
+    if (state === 'post') {
+        if (channel) {
+            const title = lg.sport === 'soccer' ? `🏁 Full Time — ${eventName}` : `🏁 Final — ${eventName}`;
+            const embed = new EmbedBuilder()
+                .setColor(0x6E33D6)
+                .setTitle(title)
+                .setDescription(wcSummaryScoreLine(summary))
+                .setFooter({ text: 'Alerts for this game have ended · via ESPN' });
+            try { await channel.send({ content: watches.map(w => `<@${w.user_id}>`).join(' '), embeds: [embed] }); } catch (e) {}
+        }
+        await dbQuery(`UPDATE bot_goal_watches SET status='done', updated_at=NOW() WHERE channel_id=$1 AND event_id=$2 AND status='active'`, [channelId, eventId]);
+        return;
+    }
+
+    if (lg.sport === 'soccer') await processSoccerGroup(watches, summary, channel, eventName);
+    else if (lg.sport === 'basketball') await processBasketballGroup(watches, summary, channel, eventName, lg);
+    else await processScoreDeltaGroup(watches, summary, channel, eventName, lg.sport);
+}
+
+// soccer: a ping per goal (scorer + assist + minute + new score), per-subscriber baseline
+async function processSoccerGroup(watches, summary, channel, eventName) {
+    const plays = wcGoalPlays(summary);
+    const currentCount = plays.length;
+    const minSeen = Math.min(...watches.map(w => w.last_goal_count || 0));
+    if (channel && currentCount > minSeen) {
+        const scoreLine = wcSummaryScoreLine(summary);
+        for (let i = minSeen; i < currentCount; i++) {
+            const followers = watches.filter(w => (w.last_goal_count || 0) <= i).map(w => w.user_id);
+            if (!followers.length) continue;
+            const embed = new EmbedBuilder()
+                .setColor(0x6E33D6)
+                .setTitle(`⚽ ${eventName}`)
+                .setDescription(`${wcGoalText(plays[i])}\n\n${scoreLine}`)
+                .setFooter({ text: 'Live via ESPN · tap Stop alerts to unsubscribe' });
+            try {
+                await channel.send({ content: followers.map(id => `<@${id}>`).join(' '), embeds: [embed], components: [wcStopRow(watches[0].event_id)] });
+            } catch (e) { console.error('goal post failed:', e.message); }
+        }
+    }
+    // bring everyone's baseline up to date (also covers VAR-disallowed goals: count drops, nothing announced)
+    for (const w of watches) {
+        if ((w.last_goal_count || 0) !== currentCount) {
+            await dbQuery(`UPDATE bot_goal_watches SET last_goal_count=$1, updated_at=NOW() WHERE id=$2`, [currentCount, w.id]);
+        }
+    }
+}
+
+// baseball / football / hockey: a ping each time the score changes (these are naturally paced)
+async function processScoreDeltaGroup(watches, summary, channel, eventName, sport) {
+    const sc = summaryScores(summary);
+    if (channel) {
+        // only ping rows that already have a baseline AND whose stored score differs from now
+        const followers = watches.filter(w => w.last_home != null && (w.last_home !== sc.home || w.last_away !== sc.away)).map(w => w.user_id);
+        if (followers.length) {
+            const embed = new EmbedBuilder()
+                .setColor(0x6E33D6)
+                .setTitle(`${SPORT_EMOJI[sport] || '📣'} Score update — ${eventName}`)
+                .setDescription(`${wcSummaryScoreLine(summary)}\n_${gameStatusText(summary)}_`)
+                .setFooter({ text: 'Live via ESPN · tap Stop alerts to unsubscribe' });
+            try { await channel.send({ content: followers.map(id => `<@${id}>`).join(' '), embeds: [embed], components: [wcStopRow(watches[0].event_id)] }); } catch (e) { console.error('score post failed:', e.message); }
+        }
+    }
+    for (const w of watches) {
+        if (w.last_home !== sc.home || w.last_away !== sc.away) {
+            await dbQuery(`UPDATE bot_goal_watches SET last_home=$1, last_away=$2, updated_at=NOW() WHERE id=$3`, [sc.home, sc.away, w.id]);
+        }
+    }
+}
+
+// basketball: scores constantly, so don't ping per basket — alert at each quarter/period boundary + final.
+// the summary header has no period, so read it from the (cached) scoreboard event.
+async function processBasketballGroup(watches, summary, channel, eventName, lg) {
+    let period = null;
+    try {
+        const events = await espnScoreboard(lg);
+        const ev = events.find(e => String(e.id) === String(watches[0].event_id));
+        period = (ev && ev.status && ev.status.period != null) ? ev.status.period : null;
+    } catch (e) {}
+    if (channel && period != null) {
+        const baseline = Math.min(...watches.map(w => (w.last_period != null ? w.last_period : period)));
+        for (let p = baseline + 1; p <= period; p++) {
+            const followers = watches.filter(w => w.last_period != null && w.last_period < p).map(w => w.user_id);
+            if (!followers.length) continue;
+            const embed = new EmbedBuilder()
+                .setColor(0x6E33D6)
+                .setTitle(`🏀 ${quarterLabel(p - 1)} — ${eventName}`)
+                .setDescription(wcSummaryScoreLine(summary))
+                .setFooter({ text: 'Live via ESPN · tap Stop alerts to unsubscribe' });
+            try { await channel.send({ content: followers.map(id => `<@${id}>`).join(' '), embeds: [embed], components: [wcStopRow(watches[0].event_id)] }); } catch (e) { console.error('quarter post failed:', e.message); }
+        }
+    }
+    for (const w of watches) {
+        if (period != null && w.last_period !== period) {
+            await dbQuery(`UPDATE bot_goal_watches SET last_period=$1, updated_at=NOW() WHERE id=$2`, [period, w.id]);
+        }
+    }
+}
+
+let goalPollRunning = false;
+async function pollGoalWatches() {
+    if (goalPollRunning) return;            // overlap guard
+    goalPollRunning = true;
+    try {
+        const { rows } = await dbQuery(`SELECT * FROM bot_goal_watches WHERE status = 'active' ORDER BY event_id`);
+        if (rows.length) {
+            const groups = new Map();       // channel|event -> rows (one summary fetch + one post stream per match)
+            for (const w of rows) {
+                const k = w.channel_id + '|' + w.event_id;
+                if (!groups.has(k)) groups.set(k, []);
+                groups.get(k).push(w);
+            }
+            for (const watches of groups.values()) {
+                try { await processGoalWatchGroup(watches); } catch (e) { console.error('goal group error:', e.message); }
+            }
+        }
+        // safety net: close anything still active long after kickoff
+        await dbQuery(`UPDATE bot_goal_watches SET status='done', updated_at=NOW() WHERE status='active' AND created_at < NOW() - INTERVAL '8 hours'`);
+    } catch (e) {
+        console.error('pollGoalWatches error:', e.message);
+    } finally {
+        goalPollRunning = false;
+    }
+}
+
+// when a member picks game(s) from the /updates dropdown, subscribe them to alerts.
+// option values are encoded "<leagueKey>:<eventId>" so a single menu can mix every sport.
+async function handleWcWatchSelect(interaction) {
+    await interaction.deferReply({ ephemeral: true });
+    try {
+        const picks = (interaction.values || []).map(v => {
+            const i = v.indexOf(':');
+            return i < 0 ? { lgKey: 'wc', eventId: v } : { lgKey: v.slice(0, i), eventId: v.slice(i + 1) };
+        });
+        const confirmed = [];
+        for (const { lgKey, eventId } of picks) {
+            const lg = espnLeague(lgKey) || WC_LEAGUE;
+            let summary = null;
+            try { summary = await espnSummary(lg, eventId); } catch (e) {}
+            const name = summary ? summaryMatchName(summary) : 'your game';
+            // baselines so the existing state isn't re-announced on the first poll
+            let goals = 0, home = null, away = null;
+            if (summary) {
+                if (lg.sport === 'soccer') goals = wcGoalPlays(summary).length;
+                const sc = summaryScores(summary);
+                home = sc.home; away = sc.away;
+            }
+            await dbQuery(
+                `INSERT INTO bot_goal_watches (user_id, channel_id, event_id, event_name, league_key, last_goal_count, last_home, last_away, last_period, status)
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NULL,'active')
+                 ON CONFLICT (user_id, event_id) WHERE status = 'active'
+                 DO UPDATE SET channel_id=EXCLUDED.channel_id, event_name=EXCLUDED.event_name, league_key=EXCLUDED.league_key, last_goal_count=EXCLUDED.last_goal_count, last_home=EXCLUDED.last_home, last_away=EXCLUDED.last_away, last_period=NULL, updated_at=NOW()`,
+                [interaction.user.id, interaction.channelId, String(eventId), name, lg.key, goals, home, away]
+            );
+            confirmed.push(name);
+        }
+        if (!confirmed.length) return interaction.editReply('Hmm, I couldn\'t set that up — please run `/updates` again.');
+        await interaction.editReply(`✅ You're all set! I'll ping you right here when there's action in:\n${confirmed.map(n => `• **${n}**`).join('\n')}\n\nTap **Stop alerts** on any alert (or run \`/updates\` again) to turn them off. Alerts stop automatically when the game ends.`);
+    } catch (e) {
+        console.error('wcwatch select error:', e);
+        await interaction.editReply('Something went wrong setting up your alerts. Please try `/updates` again.');
+    }
+}
+
+// the "Stop alerts" button cancels only the clicking user's watch for that match
+async function handleWcStopButton(interaction) {
+    const eventId = (interaction.customId.split(':')[1]) || '';
+    try {
+        const res = await dbQuery(
+            `UPDATE bot_goal_watches SET status='cancelled', updated_at=NOW() WHERE user_id=$1 AND event_id=$2 AND status='active'`,
+            [interaction.user.id, eventId]
+        );
+        if (res.rowCount > 0) {
+            await interaction.reply({ content: '🔕 Done — you won\'t get any more goal alerts for that match.', ephemeral: true });
+        } else {
+            await interaction.reply({ content: 'You weren\'t following that match (it may have already ended).', ephemeral: true });
+        }
+    } catch (e) {
+        console.error('wcstop button error:', e);
+        await interaction.reply({ content: 'Couldn\'t update that just now — please try again in a moment.', ephemeral: true });
+    }
+}
+
 // ===== WORLD CUP 2026 — TEMPORARY helpers (remove this whole block after the tournament) =====
 const WC_LEAGUE = espnLeague('wc'); // soccer / fifa.world
 const WC_WATCH_LINK = 'https://www.fifa.com/fifaplus/en/home'; // official & legal; broadcast rights vary by country
@@ -1040,6 +1335,7 @@ client.once('ready', async () => {
         { name: 'wcfixtures', description: 'World Cup: today\'s matches + kickoff times' },
         { name: 'wcstandings', description: 'World Cup: group-stage tables' },
         { name: 'wcrecap', description: 'World Cup: goals & cards for a team\'s latest match', options: [{ name: 'team', type: 3, description: 'Country — e.g. Brazil', required: true }] },
+        { name: 'updates', description: 'Pick a game, get pinged when it scores (#worldcup = soccer, #tools = all sports)' },
         // ===== end World Cup temporary commands =====
         { name: 'parlay', description: 'Calculate parlay odds & payout (wins channel only)', options: [{ name: 'odds', type: 3, description: 'Odds per leg, e.g. +150 -110 +200', required: true }, { name: 'stake', type: 10, description: 'Amount you are betting (optional)', required: false }], defaultMemberPermissions: ADMIN_ONLY }
     ];
@@ -1062,6 +1358,9 @@ client.once('ready', async () => {
     // Start the prop-watch poller: checks each active watch's live game and DMs the owner as stats move.
     pollWatches();
     setInterval(pollWatches, 45000);
+    // Start the World Cup goal-alert poller: posts in-channel + @mentions followers as goals go in.
+    pollGoalWatches();
+    setInterval(pollGoalWatches, 45000);
 });
 
 // ====== #bet-slips: IMAGES/SCREENSHOTS/FILES ONLY + LOG SLIPS ======
@@ -1129,6 +1428,9 @@ function decodeEntities(str) {
 
 // ====== INTERACTION HANDLER ======
 client.on('interactionCreate', async interaction => {
+    // World Cup goal-alert components — handle before the slash-command guard
+    if (interaction.isStringSelectMenu() && interaction.customId === 'wcwatch') return handleWcWatchSelect(interaction);
+    if (interaction.isButton() && interaction.customId.startsWith('wcstop:')) return handleWcStopButton(interaction);
     if (!interaction.isChatInputCommand()) return;
     const { commandName, options, user } = interaction;
 
@@ -1548,6 +1850,69 @@ client.on('interactionCreate', async interaction => {
         } catch (e) {
             console.error('wcfixtures error:', e);
             await interaction.editReply('Couldn\'t load the World Cup schedule right now. Please try again in a moment.');
+        }
+    }
+
+    if (commandName === 'updates') {
+        const norm = (interaction.channel?.name || '').toLowerCase().replace(/[^a-z]/g, '');
+        const isWorldcup = norm.includes('worldcup');
+        const isTools = norm.includes('tools');
+        if (!isWorldcup && !isTools) {
+            return interaction.reply({ content: '⚽ Use `/updates` in the #worldcup channel (soccer) or the #tools channel (all sports).', ephemeral: true });
+        }
+        await interaction.deferReply({ ephemeral: true });
+        try {
+            let pairs;
+            if (isWorldcup) {
+                pairs = (await wcFixtures() || []).map(ev => ({ lg: WC_LEAGUE, ev }));
+            } else {
+                pairs = await todaysGamesAllSports();
+            }
+            const open = pairs.filter(({ ev }) => {
+                const st = (ev.status && ev.status.type && ev.status.type.state) || '';
+                return st === 'pre' || st === 'in';
+            });
+            if (!open.length) {
+                return interaction.editReply(isWorldcup
+                    ? 'There are no upcoming or live World Cup matches today to follow. Check back when today\'s games are on, or use `/wcfixtures` to see the schedule.'
+                    : 'There are no games on today to follow right now. Check back when today\'s games are on.');
+            }
+            open.sort((a, b) => {
+                const ra = espnGameRank(a.ev), rb = espnGameRank(b.ev);     // 0 = live, 1 = upcoming
+                if (ra !== rb) return ra - rb;
+                return (Date.parse(a.ev.date) || 0) - (Date.parse(b.ev.date) || 0);
+            });
+            const options = open.slice(0, 25).map(({ lg, ev }) => {
+                const sc = espnScoreLine(ev);
+                const st = (ev.status && ev.status.type) || {};
+                const live = st.state === 'in';
+                const emo = SPORT_EMOJI[lg.sport] || '•';
+                const desc = isWorldcup
+                    ? (live ? `🔴 Live — ${st.shortDetail || 'in progress'}` : 'Starts later today')
+                    : `${emo} ${lg.name}${live ? ` · 🔴 ${st.shortDetail || 'live'}` : ''}`;
+                return {
+                    label: `${sc.an} vs ${sc.hn}`.slice(0, 100),
+                    description: desc.slice(0, 100),
+                    value: `${lg.key}:${ev.id}`
+                };
+            });
+            const menu = new StringSelectMenuBuilder()
+                .setCustomId('wcwatch')
+                .setPlaceholder(isWorldcup ? 'Pick the match(es) you want goal alerts for' : 'Pick the game(s) you want score alerts for')
+                .setMinValues(1)
+                .setMaxValues(options.length)
+                .addOptions(options);
+            const row = new ActionRowBuilder().addComponents(menu);
+            const blurb = isWorldcup
+                ? '⚽ **Get goal alerts** — choose one or more of today\'s matches below. The moment someone scores, I\'ll ping you right here with the scorer, the assist, and the new score. Pick as many matches as you like.'
+                : '📣 **Get score alerts** — choose one or more of today\'s games below and I\'ll ping you here when the score changes. (Soccer = full goal detail; basketball = end of each quarter + final, so your phone won\'t blow up.)';
+            await interaction.editReply({
+                content: blurb + (open.length > 25 ? '\n\n_Lots of games today — showing the first 25 (live games first)._' : ''),
+                components: [row]
+            });
+        } catch (e) {
+            console.error('updates command error:', e);
+            await interaction.editReply('Couldn\'t load today\'s games right now. Please try again in a moment.');
         }
     }
 
@@ -2023,7 +2388,7 @@ app.get('/oauth/callback', async (req, res) => {
     }
 });
 
-const BUILD_MARKER = 'news-cmd-2026-06-14-12';
+const BUILD_MARKER = 'updates-allsports-2026-06-15-14';
 app.get('/', (_req, res) => {
     let betSlips = 'unknown';
     try {
