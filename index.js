@@ -1127,11 +1127,15 @@ async function handleWcWatchSelect(interaction) {
             return i < 0 ? { lgKey: 'wc', eventId: v } : { lgKey: v.slice(0, i), eventId: v.slice(i + 1) };
         });
         const confirmed = [];
+        let anyLive = false;
         for (const { lgKey, eventId } of picks) {
             const lg = espnLeague(lgKey) || WC_LEAGUE;
             let summary = null;
             try { summary = await espnSummary(lg, eventId); } catch (e) {}
             const name = summary ? summaryMatchName(summary) : 'your game';
+            const state = summary ? summaryState(summary) : null;
+            const live = state === 'in';
+            if (live) anyLive = true;
             // baselines so the existing state isn't re-announced on the first poll
             let goals = 0, home = null, away = null;
             if (summary) {
@@ -1146,10 +1150,18 @@ async function handleWcWatchSelect(interaction) {
                  DO UPDATE SET channel_id=EXCLUDED.channel_id, event_name=EXCLUDED.event_name, league_key=EXCLUDED.league_key, last_goal_count=EXCLUDED.last_goal_count, last_home=EXCLUDED.last_home, last_away=EXCLUDED.last_away, last_period=NULL, updated_at=NOW()`,
                 [interaction.user.id, interaction.channelId, String(eventId), name, lg.key, goals, home, away]
             );
-            confirmed.push(name);
+            // immediate feedback so the member can SEE it's tracking (and the current score if live)
+            const emo = SPORT_EMOJI[lg.sport] || '•';
+            let line = `${emo} **${name}**`;
+            if (summary && live) line += ` — ${wcSummaryScoreLine(summary)}  _(live, ${gameStatusText(summary)})_`;
+            else if (state === 'pre') line += ` — _starts later today_`;
+            confirmed.push(line);
         }
         if (!confirmed.length) return interaction.editReply('Hmm, I couldn\'t set that up — please run `/updates` again.');
-        await interaction.editReply(`✅ You're all set! I'll ping you right here when there's action in:\n${confirmed.map(n => `• **${n}**`).join('\n')}\n\nTap **Stop alerts** on any alert (or run \`/updates\` again) to turn them off. Alerts stop automatically when the game ends.`);
+        const liveNote = anyLive
+            ? '\n\n_That game\'s already underway, so the score above is where things stand right now. I\'ll ping you on the **next** goal/score change — not the ones that already happened._'
+            : '';
+        await interaction.editReply(`✅ You're all set! I'll ping you right here when there's action in:\n${confirmed.join('\n')}${liveNote}\n\nTap **Stop alerts** on any alert (or run \`/updates\` again) to turn them off. Alerts stop automatically when the game ends.`);
     } catch (e) {
         console.error('wcwatch select error:', e);
         await interaction.editReply('Something went wrong setting up your alerts. Please try `/updates` again.');
@@ -1256,16 +1268,17 @@ client.once('ready', async () => {
     // sweepUnpaidMembers();
     // setInterval(sweepUnpaidMembers, 6 * 60 * 60 * 1000);
 
-    // Admin-only commands are hidden from regular members via defaultMemberPermissions.
-    // /stats, /linehistory, /livescore, /reports and /watchprop are open to all members.
+    // Most commands are open to all members. Only /parlay stays admin-only via
+    // defaultMemberPermissions. Members can use /follow, /unfollow, /following, /feed,
+    // /alerts, /stats, /linehistory, /livescore, /reports and /watchprop.
     const ADMIN_ONLY = PermissionFlagsBits.ManageGuild;
     const espnLeagueChoices = ESPN_LEAGUES.map(l => ({ name: l.name, value: l.key }));
     const data = [
-        { name: 'follow', description: 'Follow a bettor', options: [{ name: 'target', type: 6, description: 'User to follow', required: true }], defaultMemberPermissions: ADMIN_ONLY },
-        { name: 'unfollow', description: 'Stop following a bettor', options: [{ name: 'target', type: 6, description: 'User to unfollow', required: true }], defaultMemberPermissions: ADMIN_ONLY },
-        { name: 'following', description: 'See who you are following', defaultMemberPermissions: ADMIN_ONLY },
-        { name: 'feed', description: 'See recent slips from users you follow', defaultMemberPermissions: ADMIN_ONLY },
-        { name: 'alerts', description: 'Turn DM alerts on or off', options: [{ name: 'state', type: 3, description: 'on or off', required: true }], defaultMemberPermissions: ADMIN_ONLY },
+        { name: 'follow', description: 'Follow a bettor', options: [{ name: 'target', type: 6, description: 'User to follow', required: true }] },
+        { name: 'unfollow', description: 'Stop following a bettor', options: [{ name: 'target', type: 6, description: 'User to unfollow', required: true }] },
+        { name: 'following', description: 'See who you are following' },
+        { name: 'feed', description: 'See recent slips from users you follow' },
+        { name: 'alerts', description: 'Turn DM alerts on or off', options: [{ name: 'state', type: 3, description: 'on or off', required: true }] },
         { name: 'stats', description: 'Look up player or team sports stats (members chat only)', options: [{ name: 'question', type: 3, description: 'e.g. LeBron points this season, or Lakers record this season', required: true }] },
         { name: 'linehistory', description: 'Show how a team or player\'s odds have moved (members chat only)', options: [
             { name: 'team', type: 3, description: 'Team OR player name — e.g. Lakers, Wembanyama, Salah', required: true },
@@ -1440,15 +1453,21 @@ client.on('interactionCreate', async interaction => {
         return interaction.reply({ content: '👀 Only the `/watchprop` command can be used in this channel.', ephemeral: true });
     }
 
+    // The follow-a-bettor commands work only in the #betslips channel.
+    const FOLLOW_CMDS = ['follow', 'unfollow', 'following', 'feed', 'alerts'];
+    if (FOLLOW_CMDS.includes(commandName) && !chNorm.includes('betslips')) {
+        return interaction.reply({ content: '🧾 The `/follow`, `/unfollow`, `/following`, `/feed` and `/alerts` commands can only be used in the #betslips channel.', ephemeral: true });
+    }
+
     if (commandName === 'follow') {
         const target = options.getUser('target');
         if (!followers[user.id]) followers[user.id] = [];
         if (!followers[user.id].includes(target.id)) {
             followers[user.id].push(target.id);
             saveFollowers();
-            await interaction.reply(`You are now following **${target.username}**`);
+            await interaction.reply({ content: `You are now following **${target.username}**`, ephemeral: true });
         } else {
-            await interaction.reply(`You are already following **${target.username}**`);
+            await interaction.reply({ content: `You are already following **${target.username}**`, ephemeral: true });
         }
     }
 
@@ -1458,32 +1477,32 @@ client.on('interactionCreate', async interaction => {
             followers[user.id] = followers[user.id].filter(id => id !== target.id);
             saveFollowers();
         }
-        await interaction.reply(`You unfollowed **${target.username}**`);
+        await interaction.reply({ content: `You unfollowed **${target.username}**`, ephemeral: true });
     }
 
     if (commandName === 'following') {
         const followed = followers[user.id] || [];
-        if (followed.length === 0) return interaction.reply('You are not following anyone.');
+        if (followed.length === 0) return interaction.reply({ content: 'You are not following anyone.', ephemeral: true });
         let names = followed.map(id => client.users.cache.get(id)?.username || 'Unknown').join('\n- ');
-        await interaction.reply(`You are following:\n- ${names}`);
+        await interaction.reply({ content: `You are following:\n- ${names}`, ephemeral: true });
     }
 
     if (commandName === 'feed') {
         const followed = followers[user.id] || [];
-        if (followed.length === 0) return interaction.reply('You are not following anyone.');
+        if (followed.length === 0) return interaction.reply({ content: 'You are not following anyone.', ephemeral: true });
         let recentSlips = slips
             .filter(slip => followed.includes(slip.userId))
             .slice(-5)
             .map(slip => `${slip.username}: ${slip.content} ${slip.attachmentUrl || ''}`)
             .join('\n\n');
-        await interaction.reply(recentSlips || 'No recent slips from followed users.');
+        await interaction.reply({ content: recentSlips || 'No recent slips from followed users.', ephemeral: true });
     }
 
     if (commandName === 'alerts') {
         const toggle = options.getString('state');
         alerts[user.id] = toggle.toLowerCase() === 'on';
         saveAlerts();
-        await interaction.reply(`DM alerts turned **${toggle.toUpperCase()}**`);
+        await interaction.reply({ content: `DM alerts turned **${toggle.toUpperCase()}**`, ephemeral: true });
     }
 
     // ===== /stats — StatMuse lookup, members chat or #tools =====
@@ -2388,7 +2407,7 @@ app.get('/oauth/callback', async (req, res) => {
     }
 });
 
-const BUILD_MARKER = 'updates-allsports-2026-06-15-14';
+const BUILD_MARKER = 'follow-betslips-only-2026-06-15-17';
 app.get('/', (_req, res) => {
     let betSlips = 'unknown';
     try {
