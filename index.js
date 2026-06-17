@@ -1271,46 +1271,106 @@ function wcPlayerStat(player, name) {
     return Number.isFinite(v) ? v : 0;
 }
 
-// /teamstats — a member tapped a team button: show that team's players + goals, assists & shots on target for today's match
+// /teamstats — read the state ('pre' | 'in' | 'post') from a team-schedule event
+function wcEventState(ev) {
+    const st = ((((ev || {}).competitions || [])[0] || {}).status) || (ev && ev.status) || {};
+    return (st.type && st.type.state) || null;
+}
+
+// /teamstats — a member tapped a team button: show that team's players with their
+// World Cup-so-far totals (goals, assists, shots on target) added up across every match
+// the team has played. This means the numbers are useful BEFORE kickoff (form going in)
+// and keep climbing live while today's match is being played.
 async function handleTeamStatsButton(interaction) {
     const parts = interaction.customId.split(':');
-    const eventId = parts[1] || '';
+    const todayEventId = parts[1] || '';
     const teamId = parts[2] || '';
     await interaction.deferReply({ ephemeral: true });
     try {
-        const summary = await espnSummary(WC_LEAGUE, eventId);
-        const rosters = (summary && summary.rosters) || [];
-        const mine = rosters.find(r => r.team && String(r.team.id) === String(teamId));
-        const opp = rosters.find(r => r !== mine);
-        const teamName = (mine && mine.team && mine.team.displayName) || 'Team';
-        const oppName = (opp && opp.team && opp.team.displayName) || 'opponent';
-        const state = summaryState(summary);
-        if (state === 'pre') {
-            return interaction.editReply(`⚽ **${teamName}** vs ${oppName} hasn't kicked off yet — player stats (goals, assists, shots on target) show up once the match is underway. Check back after kickoff.`);
+        // today's match → opponent + status (also a stat source if it's live/finished)
+        let todaySummary = null;
+        try { todaySummary = await espnSummary(WC_LEAGUE, todayEventId); } catch (e) {}
+        const tComp = (((todaySummary || {}).header || {}).competitions || [])[0] || {};
+        const tCompetitors = tComp.competitors || [];
+        const meC = tCompetitors.find(c => c.team && String(c.team.id) === String(teamId));
+        const oppC = tCompetitors.find(c => c.team && String(c.team.id) !== String(teamId));
+        const oppName = (oppC && oppC.team && (oppC.team.displayName || oppC.team.shortDisplayName)) || 'opponent';
+        const todayState = summaryState(todaySummary) || null;
+        const epoch = Math.floor((Date.parse(tComp.date) || 0) / 1000);
+
+        // the team's World Cup schedule (one call) → which matches to total up
+        let sched = null, schedFailed = false;
+        try { sched = await espnGet(`${ESPN_BASE}/soccer/fifa.world/teams/${teamId}/schedule`, 60000); } catch (e) { schedFailed = true; }
+        if (!sched) schedFailed = true;
+        const teamName = (sched && sched.team && sched.team.displayName)
+            || (meC && meC.team && meC.team.displayName) || 'This team';
+
+        // event ids to total: every played/live match on the schedule, plus today if it's underway/finished
+        const ids = new Map();
+        let anyLive = todayState === 'in';
+        for (const e of ((sched && sched.events) || [])) {
+            const s = wcEventState(e);
+            if (s === 'in' || s === 'post') ids.set(String(e.id), true);
+            if (s === 'in') anyLive = true;
         }
-        if (!mine || !(mine.roster && mine.roster.length)) {
-            return interaction.editReply(`Couldn't load ${teamName}'s player stats right now. Please try again in a moment.`);
+        if (todayState === 'in' || todayState === 'post') ids.set(String(todayEventId), true);
+
+        // context line about today's match
+        let context = '';
+        if (todayState === 'in') context = `_Today: vs ${oppName} · 🔴 live now_`;
+        else if (todayState === 'pre') context = `_Today: vs ${oppName}${epoch ? ` · kickoff <t:${epoch}:t>` : ''}_`;
+        else if (todayState === 'post') context = `_Today: vs ${oppName} · ✅ final_`;
+
+        if (!ids.size) {
+            // if we couldn't even load the schedule (and today isn't live/finished), say so rather than implying they haven't played
+            if (schedFailed && todayState !== 'in' && todayState !== 'post') {
+                return interaction.editReply(
+                    `⚽ Couldn't load **${teamName}**'s World Cup history right now.` +
+                    (context ? `\n${context}` : '') +
+                    `\n\nPlease try again in a moment.`
+                );
+            }
+            return interaction.editReply(
+                `⚽ **${teamName}** — first game, no stats yet.` +
+                (context ? `\n${context}` : '') +
+                `\n\n_Player stats show up once they kick off, then keep updating live during the match._`
+            );
         }
-        const players = (mine.roster || [])
-            .filter(p => p.starter || p.subbedIn || wcPlayerStat(p, 'appearances') >= 1)
-            .map(p => ({
-                name: (p.athlete && p.athlete.displayName) || '',
-                g: wcPlayerStat(p, 'totalGoals'),
-                a: wcPlayerStat(p, 'goalAssists'),
-                sot: wcPlayerStat(p, 'shotsOnTarget')
-            }))
-            .filter(p => p.name)
+
+        // total the three stats per player across those matches
+        const agg = new Map(); // athleteId -> { name, g, a, sot }
+        for (const id of ids.keys()) {
+            let summary = (id === String(todayEventId) && todaySummary) ? todaySummary : null;
+            if (!summary) { try { summary = await espnSummary(WC_LEAGUE, id); } catch (e) { continue; } }
+            const r = ((summary && summary.rosters) || []).find(x => x.team && String(x.team.id) === String(teamId));
+            if (!r) continue;
+            for (const p of (r.roster || [])) {
+                if (!(p.starter || p.subbedIn || wcPlayerStat(p, 'appearances') >= 1)) continue;
+                const aid = p.athlete && p.athlete.id;
+                const name = p.athlete && p.athlete.displayName;
+                if (!aid || !name) continue;
+                const cur = agg.get(aid) || { name, g: 0, a: 0, sot: 0 };
+                cur.g += wcPlayerStat(p, 'totalGoals');
+                cur.a += wcPlayerStat(p, 'goalAssists');
+                cur.sot += wcPlayerStat(p, 'shotsOnTarget');
+                agg.set(aid, cur);
+            }
+        }
+
+        const players = [...agg.values()]
             .sort((x, y) => (y.g * 100 + y.a * 10 + y.sot) - (x.g * 100 + x.a * 10 + x.sot) || x.name.localeCompare(y.name));
         const lines = players.map(p => `⚽ ${p.g} · 🅰️ ${p.a} · 🎯 ${p.sot} — **${p.name}**`);
-        const statusBit = state === 'in' ? `🔴 Live · ${gameStatusText(summary)}` : '✅ Final';
-        const header = `_${teamName} vs ${oppName}_\n${wcSummaryScoreLine(summary)} · ${statusBit}\n\n` +
+        const matchWord = ids.size === 1 ? '1 match' : `${ids.size} matches`;
+        const liveNote = anyLive ? '  ·  🔴 includes today\'s live match' : '';
+        const header = (context ? `${context}\n\n` : '') +
+            `📊 **World Cup so far** (${matchWord})${liveNote}\n` +
             `⚽ goals · 🅰️ assists · 🎯 shots on target\n`;
-        const body = lines.length ? lines.join('\n') : 'No players have a goal, assist, or shot on target yet.';
+        const body = lines.length ? lines.join('\n') : 'No goals, assists, or shots on target recorded yet.';
         const embed = new EmbedBuilder()
             .setColor(0x6E33D6)
             .setTitle(`⚽ ${teamName} — Player Stats`)
             .setDescription((header + '\n' + body).slice(0, 4000))
-            .setFooter({ text: 'This match only · via ESPN' });
+            .setFooter({ text: 'World Cup totals · updates live · via ESPN' });
         await interaction.editReply({ embeds: [embed] });
     } catch (e) {
         console.error('teamstats button error:', e);
@@ -1977,7 +2037,7 @@ client.on('interactionCreate', async interaction => {
             }
             if (current.components.length) rows.push(current);
             await interaction.editReply({
-                content: `⚽ **Today's World Cup teams** — tap a team to see its players' **goals, assists & shots on target**.\n\n${matchupLines.join('\n')}\n\n_Stats fill in once a match kicks off._`,
+                content: `⚽ **Today's World Cup teams** — tap a team to see its players' **goals, assists & shots on target** so far this World Cup.\n\n${matchupLines.join('\n')}\n\n_Totals are there before kickoff and keep updating live during the game. (A team playing its first match won't have numbers yet.)_`,
                 components: rows.slice(0, 5)
             });
         } catch (e) {
