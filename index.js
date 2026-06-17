@@ -1197,9 +1197,17 @@ function wcStat(stats, name) {
     return s ? String(s.displayValue != null ? s.displayValue : s.value) : '0';
 }
 
-// today's (UTC) World Cup fixtures; fall back to the current matchday board if today is empty
+// Build a YYYYMMDD date string in the community's timezone (US Eastern) so evening
+// games don't roll over to "tomorrow" the way a raw UTC date would.
+function espnDateET(date = new Date()) {
+    return new Intl.DateTimeFormat('en-CA', {
+        timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit'
+    }).format(date).replace(/-/g, '');
+}
+
+// today's (US Eastern) World Cup fixtures; fall back to the current matchday board if today is empty
 async function wcFixtures() {
-    const ymd = new Date().toISOString().slice(0, 10).replace(/-/g, '');
+    const ymd = espnDateET();
     let events = [];
     try { const d = await espnGet(`${ESPN_BASE}/soccer/fifa.world/scoreboard?dates=${ymd}`, 20000); events = (d && d.events) || []; } catch (e) {}
     if (!events.length && WC_LEAGUE) { try { events = await espnScoreboard(WC_LEAGUE); } catch (e) {} }
@@ -1237,7 +1245,7 @@ async function wcFindRecentGame(query) {
     const recapRank = ev => { const s = ev.status && ev.status.type && ev.status.type.state; return s === 'in' ? 0 : s === 'post' ? 1 : 2; };
     let best = null;
     for (let off = 1; off >= -10; off--) {
-        const ymd = new Date(now + off * ms).toISOString().slice(0, 10).replace(/-/g, '');
+        const ymd = espnDateET(new Date(now + off * ms));
         let events = [];
         try { const d = await espnGet(`${ESPN_BASE}/soccer/fifa.world/scoreboard?dates=${ymd}`, 60000); events = (d && d.events) || []; } catch (e) { continue; }
         for (const ev of events) {
@@ -2407,7 +2415,7 @@ app.get('/oauth/callback', async (req, res) => {
     }
 });
 
-const BUILD_MARKER = 'follow-betslips-only-2026-06-15-17';
+const BUILD_MARKER = 'updates-eastern-time-2026-06-16-18';
 app.get('/', (_req, res) => {
     let betSlips = 'unknown';
     try {
