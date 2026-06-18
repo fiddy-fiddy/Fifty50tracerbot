@@ -1413,6 +1413,283 @@ client.once('ready', async () => {
                 { name: 'NFL', value: 'nfl' },
                 { name: 'College Football', value: 'ncaaf' },
                 { name: 'College Basketball', value: 'ncaab' },
+         const stopRow = new ActionRowBuilder().addComponents(
+            new ButtonBuilder().setCustomId('updstopall').setLabel('Stop all my alerts').setStyle(ButtonStyle.Danger).setEmoji('🔕')
+        );
+        await interaction.editReply({
+            content: `✅ You're all set! I'll ping you right here when there's action in:\n${confirmed.join('\n')}${liveNote}\n\nTap **Stop all my alerts** below to turn them all off at once (or **Stop alerts** on an individual alert). Alerts also stop automatically when the game ends.`,
+            components: [stopRow]
+        });
+    } catch (e) {
+        console.error('wcwatch select error:', e);
+        await interaction.editReply('Something went wrong setting up your alerts. Please try `/updates` again.');
+    }
+}
+
+// the "Stop all my alerts" button (shown on the /updates confirmation) cancels EVERY active
+// score/goal alert for the clicking user in one tap
+async function handleUpdatesStopAll(interaction) {
+    try {
+        const res = await dbQuery(
+            `UPDATE bot_goal_watches SET status='cancelled', updated_at=NOW() WHERE user_id=$1 AND status='active'`,
+            [interaction.user.id]
+        );
+        if (res.rowCount > 0) {
+            await interaction.reply({ content: `🔕 Done — I turned off all ${res.rowCount} of your game alert${res.rowCount === 1 ? '' : 's'}.`, ephemeral: true });
+        } else {
+            await interaction.reply({ content: 'You don\'t have any active game alerts right now.', ephemeral: true });
+        }
+    } catch (e) {
+        console.error('updates stop-all error:', e);
+        await interaction.reply({ content: 'Couldn\'t update that just now — please try again in a moment.', ephemeral: true });
+    }
+}
+
+// the "Stop alerts" button cancels only the clicking user's watch for that match
+async function handleWcStopButton(interaction) {
+    const eventId = (interaction.customId.split(':')[1]) || '';
+    try {
+        const res = await dbQuery(
+            `UPDATE bot_goal_watches SET status='cancelled', updated_at=NOW() WHERE user_id=$1 AND event_id=$2 AND status='active'`,
+            [interaction.user.id, eventId]
+        );
+        if (res.rowCount > 0) {
+            await interaction.reply({ content: '🔕 Done — you won\'t get any more goal alerts for that match.', ephemeral: true });
+        } else {
+            await interaction.reply({ content: 'You weren\'t following that match (it may have already ended).', ephemeral: true });
+        }
+    } catch (e) {
+        console.error('wcstop button error:', e);
+        await interaction.reply({ content: 'Couldn\'t update that just now — please try again in a moment.', ephemeral: true });
+    }
+}
+
+// ===== WORLD CUP 2026 — TEMPORARY helpers (remove this whole block after the tournament) =====
+const WC_LEAGUE = espnLeague('wc'); // soccer / fifa.world
+const WC_WATCH_LINK = 'https://www.fifa.com/fifaplus/en/home'; // official & legal; broadcast rights vary by country
+
+// pull one standings stat as its display string (e.g. points, pointDifferential "+2")
+function wcStat(stats, name) {
+    const s = (stats || []).find(x => x.name === name);
+    return s ? String(s.displayValue != null ? s.displayValue : s.value) : '0';
+}
+
+// Build a YYYYMMDD date string in the community's timezone (US Eastern) so evening
+// games don't roll over to "tomorrow" the way a raw UTC date would.
+function espnDateET(date = new Date()) {
+    return new Intl.DateTimeFormat('en-CA', {
+        timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit'
+    }).format(date).replace(/-/g, '');
+}
+
+// today's (US Eastern) World Cup fixtures; fall back to the current matchday board if today is empty
+async function wcFixtures() {
+    const ymd = espnDateET();
+    let events = [];
+    try { const d = await espnGet(`${ESPN_BASE}/soccer/fifa.world/scoreboard?dates=${ymd}`, 20000); events = (d && d.events) || []; } catch (e) {}
+    if (!events.length && WC_LEAGUE) { try { events = await espnScoreboard(WC_LEAGUE); } catch (e) {} }
+    return events;
+}
+
+// all World Cup group tables
+async function wcStandings() {
+    const d = await espnGet('https://site.api.espn.com/apis/v2/sports/soccer/fifa.world/standings', 60000);
+    return (d && d.children) || [];
+}
+
+// goals + cards (in match order) from a summary's keyEvents
+function wcMatchEvents(summary) {
+    const ke = (summary && summary.keyEvents) || [];
+    const keep = /goal|penalty|red card|yellow card/i;
+    const out = [];
+    for (const e of ke) {
+        const type = (e.type && (e.type.text || e.type.id)) || '';
+        if (!keep.test(type)) continue;
+        out.push({
+            type,
+            clock: (e.clock && e.clock.displayValue) || '',
+            team: (e.team && (e.team.displayName || e.team.abbreviation)) || '',
+            players: (e.participants || []).map(p => p.athlete && p.athlete.displayName).filter(Boolean)
+        });
+    }
+    return out;
+}
+// /wcrecap needs a team's LATEST match, which may be on an earlier matchday. The default
+// scoreboard only shows the current matchday, so scan recent dated boards (and tomorrow).
+async function wcFindRecentGame(query) {
+    if (!WC_LEAGUE) return null;
+    const ms = 86400000, now = Date.now();
+    const recapRank = ev => { const s = ev.status && ev.status.type && ev.status.type.state; return s === 'in' ? 0 : s === 'post' ? 1 : 2; };
+    let best = null;
+    for (let off = 1; off >= -10; off--) {
+        const ymd = espnDateET(new Date(now + off * ms));
+        let events = [];
+        try { const d = await espnGet(`${ESPN_BASE}/soccer/fifa.world/scoreboard?dates=${ymd}`, 60000); events = (d && d.events) || []; } catch (e) { continue; }
+        for (const ev of events) {
+            const score = espnTeamScore(query, ev);
+            if (score < 80) continue;
+            const cand = { lg: WC_LEAGUE, ev, score, rank: recapRank(ev), when: Date.parse(ev.date) || 0 };
+            if (!best) { best = cand; continue; }
+            if (cand.score !== best.score) { if (cand.score > best.score) best = cand; }
+            else if (cand.rank !== best.rank) { if (cand.rank < best.rank) best = cand; }
+            else if (cand.rank === 2) { if (cand.when < best.when) best = cand; } // soonest upcoming
+            else { if (cand.when > best.when) best = cand; }                       // most recent live/finished
+        }
+        if (best && best.rank === 0) break; // a live match wins outright
+    }
+    return best;
+}
+
+// /teamstats — read one soccer player's stat value by ESPN stat name (totalGoals / goalAssists / shotsOnTarget)
+function wcPlayerStat(player, name) {
+    const s = ((player && player.stats) || []).find(x => x.name === name);
+    if (!s) return 0;
+    const v = s.value != null ? s.value : parseFloat(s.displayValue);
+    return Number.isFinite(v) ? v : 0;
+}
+
+// /teamstats — read the state ('pre' | 'in' | 'post') from a team-schedule event
+function wcEventState(ev) {
+    const st = ((((ev || {}).competitions || [])[0] || {}).status) || (ev && ev.status) || {};
+    return (st.type && st.type.state) || null;
+}
+
+// /teamstats — a member tapped a team button: show that team's players with their
+// World Cup-so-far totals (goals, assists, shots on target) added up across every match
+// the team has played. This means the numbers are useful BEFORE kickoff (form going in)
+// and keep climbing live while today's match is being played.
+async function handleTeamStatsButton(interaction) {
+    const parts = interaction.customId.split(':');
+    const todayEventId = parts[1] || '';
+    const teamId = parts[2] || '';
+    await interaction.deferReply({ ephemeral: true });
+    try {
+        // today's match → opponent + status (also a stat source if it's live/finished)
+        let todaySummary = null;
+        try { todaySummary = await espnSummary(WC_LEAGUE, todayEventId); } catch (e) {}
+        const tComp = (((todaySummary || {}).header || {}).competitions || [])[0] || {};
+        const tCompetitors = tComp.competitors || [];
+        const meC = tCompetitors.find(c => c.team && String(c.team.id) === String(teamId));
+        const oppC = tCompetitors.find(c => c.team && String(c.team.id) !== String(teamId));
+        const oppName = (oppC && oppC.team && (oppC.team.displayName || oppC.team.shortDisplayName)) || 'opponent';
+        const todayState = summaryState(todaySummary) || null;
+        const epoch = Math.floor((Date.parse(tComp.date) || 0) / 1000);
+
+        // the team's World Cup schedule (one call) → which matches to total up
+        let sched = null, schedFailed = false;
+        try { sched = await espnGet(`${ESPN_BASE}/soccer/fifa.world/teams/${teamId}/schedule`, 60000); } catch (e) { schedFailed = true; }
+        if (!sched) schedFailed = true;
+        const teamName = (sched && sched.team && sched.team.displayName)
+            || (meC && meC.team && meC.team.displayName) || 'This team';
+
+        // event ids to total: every played/live match on the schedule, plus today if it's underway/finished
+        const ids = new Map();
+        let anyLive = todayState === 'in';
+        for (const e of ((sched && sched.events) || [])) {
+            const s = wcEventState(e);
+            if (s === 'in' || s === 'post') ids.set(String(e.id), true);
+            if (s === 'in') anyLive = true;
+        }
+        if (todayState === 'in' || todayState === 'post') ids.set(String(todayEventId), true);
+
+        // context line about today's match
+        let context = '';
+        if (todayState === 'in') context = `_Today: vs ${oppName} · 🔴 live now_`;
+        else if (todayState === 'pre') context = `_Today: vs ${oppName}${epoch ? ` · kickoff <t:${epoch}:t>` : ''}_`;
+        else if (todayState === 'post') context = `_Today: vs ${oppName} · ✅ final_`;
+
+        if (!ids.size) {
+            // if we couldn't even load the schedule (and today isn't live/finished), say so rather than implying they haven't played
+            if (schedFailed && todayState !== 'in' && todayState !== 'post') {
+                return interaction.editReply(
+                    `⚽ Couldn't load **${teamName}**'s World Cup history right now.` +
+                    (context ? `\n${context}` : '') +
+                    `\n\nPlease try again in a moment.`
+                );
+            }
+            return interaction.editReply(
+                `⚽ **${teamName}** — first game, no stats yet.` +
+                (context ? `\n${context}` : '') +
+                `\n\n_Player stats show up once they kick off, then keep updating live during the match._`
+            );
+        }
+
+        // total the three stats per player across those matches
+        const agg = new Map(); // athleteId -> { name, g, a, sot }
+        for (const id of ids.keys()) {
+            let summary = (id === String(todayEventId) && todaySummary) ? todaySummary : null;
+            if (!summary) { try { summary = await espnSummary(WC_LEAGUE, id); } catch (e) { continue; } }
+            const r = ((summary && summary.rosters) || []).find(x => x.team && String(x.team.id) === String(teamId));
+            if (!r) continue;
+            for (const p of (r.roster || [])) {
+                if (!(p.starter || p.subbedIn || wcPlayerStat(p, 'appearances') >= 1)) continue;
+                const aid = p.athlete && p.athlete.id;
+                const name = p.athlete && p.athlete.displayName;
+                if (!aid || !name) continue;
+                const cur = agg.get(aid) || { name, g: 0, a: 0, sot: 0 };
+                cur.g += wcPlayerStat(p, 'totalGoals');
+                cur.a += wcPlayerStat(p, 'goalAssists');
+                cur.sot += wcPlayerStat(p, 'shotsOnTarget');
+                agg.set(aid, cur);
+            }
+        }
+
+        const players = [...agg.values()]
+            .sort((x, y) => (y.g * 100 + y.a * 10 + y.sot) - (x.g * 100 + x.a * 10 + x.sot) || x.name.localeCompare(y.name));
+        const lines = players.map(p => `⚽ ${p.g} · 🅰️ ${p.a} · 🎯 ${p.sot} — **${p.name}**`);
+        const matchWord = ids.size === 1 ? '1 match' : `${ids.size} matches`;
+        const liveNote = anyLive ? '  ·  🔴 includes today\'s live match' : '';
+        const header = (context ? `${context}\n\n` : '') +
+            `📊 **World Cup so far** (${matchWord})${liveNote}\n` +
+            `⚽ goals · 🅰️ assists · 🎯 shots on target\n`;
+        const body = lines.length ? lines.join('\n') : 'No goals, assists, or shots on target recorded yet.';
+        const embed = new EmbedBuilder()
+            .setColor(0x6E33D6)
+            .setTitle(`⚽ ${teamName} — Player Stats`)
+            .setDescription((header + '\n' + body).slice(0, 4000))
+            .setFooter({ text: 'World Cup totals · updates live · via ESPN' });
+        await interaction.editReply({ embeds: [embed] });
+    } catch (e) {
+        console.error('teamstats button error:', e);
+        await interaction.editReply('Couldn\'t load those player stats right now. Please try again in a moment.');
+    }
+}
+// ===== end World Cup temporary helpers =====
+
+// ====== BOT READY & COMMAND REGISTRATION ======
+client.once('ready', async () => {
+    console.log(`${client.user.tag} is online!`);
+    try { await initDb(); } catch (e) { console.error('DB init failed:', e); }
+
+    // Auto-sweep DISABLED on purpose. It kicked EVERY member without the PAID role,
+    // including the owner's friends/staff and customers who had paid but not yet
+    // clicked their Discord connect link. Removal now happens only via Stripe
+    // webhooks (cancel / refund / dispute), which is precise and safe.
+    // sweepUnpaidMembers();
+    // setInterval(sweepUnpaidMembers, 6 * 60 * 60 * 1000);
+
+    // Most commands are open to all members. Only /parlay stays admin-only via
+    // defaultMemberPermissions. Members can use /follow, /unfollow, /following, /feed,
+    // /alerts, /stats, /linehistory, /livescore, /reports and /watchprop.
+    const ADMIN_ONLY = PermissionFlagsBits.ManageGuild;
+    const espnLeagueChoices = ESPN_LEAGUES.map(l => ({ name: l.name, value: l.key }));
+    const data = [
+        { name: 'follow', description: 'Follow a bettor', options: [{ name: 'target', type: 6, description: 'User to follow', required: true }] },
+        { name: 'unfollow', description: 'Stop following a bettor', options: [{ name: 'target', type: 6, description: 'User to unfollow', required: true }] },
+        { name: 'following', description: 'See who you are following' },
+        { name: 'feed', description: 'See recent slips from users you follow' },
+        { name: 'alerts', description: 'Turn DM alerts on or off', options: [{ name: 'state', type: 3, description: 'on or off', required: true }] },
+        { name: 'stats', description: 'Look up player or team sports stats (members chat or #tools)', options: [{ name: 'question', type: 3, description: 'e.g. LeBron points this season, or Lakers record this season', required: true }] },
+        { name: 'linehistory', description: 'Show how a team or player\'s odds have moved (#tools only)', options: [
+            { name: 'team', type: 3, description: 'Team OR player name — e.g. Lakers, Wembanyama, Salah', required: true },
+            { name: 'league', type: 3, description: 'Optional: narrow the search to one league', required: false, choices: [
+                { name: 'MLB', value: 'mlb' },
+                { name: 'NBA', value: 'nba' },
+                { name: 'NHL', value: 'nhl' },
+                { name: 'WNBA', value: 'wnba' },
+                { name: 'NFL', value: 'nfl' },
+                { name: 'College Football', value: 'ncaaf' },
+                { name: 'College Basketball', value: 'ncaab' },
                 { name: 'MLS', value: 'mls' },
                 { name: 'Premier League', value: 'epl' },
                 { name: 'Champions League', value: 'ucl' },
@@ -1444,29 +1721,7 @@ client.once('ready', async () => {
             { name: 'team', type: 3, description: 'Team or city — e.g. Lakers, Yankees, Chiefs', required: true },
             { name: 'league', type: 3, description: 'Optional: pick the league to search faster', required: false, choices: espnLeagueChoices }
         ] },
-        { name: 'watchprop', description: 'Watch a player\'s live stat and get DMs as it climbs', options: [
-            { name: 'player', type: 3, description: 'Player name — e.g. LeBron James', required: true },
-            { name: 'stat', type: 3, description: 'Which stat to watch (basketball, baseball, or hockey)', required: true, choices: [
-                { name: '🏀 Points', value: 'points' },
-                { name: '🏀 Rebounds', value: 'rebounds' },
-                { name: '🏀 Assists', value: 'assists' },
-                { name: '🏀 3-Pointers', value: 'threes' },
-                { name: '🏀 Steals', value: 'steals' },
-                { name: '🏀 Blocks', value: 'blocks' },
-                { name: '⚾ Home Runs', value: 'homeruns' },
-                { name: '⚾ Hits', value: 'hits' },
-                { name: '⚾ RBIs', value: 'rbis' },
-                { name: '⚾ Runs', value: 'runs' },
-                { name: '⚾ Strikeouts (pitcher)', value: 'strikeouts' },
-                { name: '🏒 Goals', value: 'goals' },
-                { name: '🏒 Assists', value: 'hkassists' },
-                { name: '🏒 Shots on Goal', value: 'shots' },
-                { name: '🏒 Hits', value: 'hkhits' },
-                { name: '🏒 Saves (goalie)', value: 'saves' }
-            ] },
-            { name: 'target', type: 4, description: 'Your number — e.g. 25', required: true, min_value: 1 },
-            { name: 'league', type: 3, description: 'Optional: pick the league to find the game faster', required: false, choices: espnLeagueChoices }
-        ] },
+        { name: 'watchprop', description: 'Watch a player\'s stat & get DMs as it climbs — pick a sport to start' },
         // ===== WORLD CUP 2026 — TEMPORARY commands (remove these 3 after the tournament) =====
         { name: 'wcfixtures', description: 'World Cup: today\'s matches + kickoff times' },
         { name: 'wcstandings', description: 'World Cup: group-stage tables' },
@@ -1568,7 +1823,13 @@ client.on('interactionCreate', async interaction => {
     // World Cup goal-alert components — handle before the slash-command guard
     if (interaction.isStringSelectMenu() && interaction.customId === 'wcwatch') return handleWcWatchSelect(interaction);
     if (interaction.isButton() && interaction.customId.startsWith('wcstop:')) return handleWcStopButton(interaction);
+    if (interaction.isButton() && interaction.customId === 'updstopall') return handleUpdatesStopAll(interaction);
     if (interaction.isButton() && interaction.customId.startsWith('ts:')) return handleTeamStatsButton(interaction);
+    // /watchprop click-through: sport button -> player modal -> player select -> prop select
+    if (interaction.isButton() && interaction.customId.startsWith('wp:sport:')) return handleWatchSportButton(interaction);
+    if (interaction.isModalSubmit() && interaction.customId.startsWith('wp:modal:')) return handleWatchModalSubmit(interaction);
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('wp:player:')) return handleWatchPlayerSelect(interaction);
+    if (interaction.isStringSelectMenu() && interaction.customId.startsWith('wp:prop:')) return handleWatchPropSelect(interaction);
     if (!interaction.isChatInputCommand()) return;
     const { commandName, options, user } = interaction;
 
@@ -1708,11 +1969,11 @@ client.on('interactionCreate', async interaction => {
         await interaction.reply({ embeds: [embed] });
     }
 
-    // ===== /linehistory — line movement graph, members chat or #tools =====
+    // ===== /linehistory — line movement graph, #tools only =====
     if (commandName === 'linehistory') {
         const norm = (interaction.channel?.name || '').toLowerCase().replace(/[^a-z]/g, '');
-        if (!norm.includes('memberschat') && !norm.includes('tools')) {
-            return interaction.reply({ content: '📈 The `/linehistory` command can be used in the members chat or #tools.', ephemeral: true });
+        if (!norm.includes('tools')) {
+            return interaction.reply({ content: '📈 The `/linehistory` command can only be used in the #tools channel.', ephemeral: true });
         }
         const teamQuery = options.getString('team');
         const leagueKey = options.getString('league') || null;
@@ -1920,243 +2181,11 @@ client.on('interactionCreate', async interaction => {
         }
     }
 
-    // ===== /news — latest team headlines/trades via ESPN, members chat or #tools =====
+    // ===== /news — latest team headlines/trades via ESPN, #tools only =====
     if (commandName === 'news') {
         const norm = (interaction.channel?.name || '').toLowerCase().replace(/[^a-z]/g, '');
-        if (!norm.includes('memberschat') && !norm.includes('tools')) {
-            return interaction.reply({ content: '📰 The `/news` command can be used in the members chat or #tools.', ephemeral: true });
-        }
-        const teamQuery = options.getString('team');
-        const leagueKey = options.getString('league') || null;
-        await interaction.deferReply({ ephemeral: norm.includes('tools') });
-        try {
-            const match = await findEspnTeam(teamQuery, leagueKey);
-            if (!match) {
-                return interaction.editReply(`I couldn't find a team called **${teamQuery}**. Try the team name or city — e.g. \`Lakers\`, \`Yankees\`, \`Chiefs\` — or pick a **league** from the list.`);
-            }
-            const { lg, team } = match;
-            const articles = await espnTeamNews(lg, team.id);
-            if (!articles.length) {
-                return interaction.editReply(`No recent headlines for **${team.displayName}** right now. Check back later, or try a **league** filter.`);
-            }
-            const lines = articles.slice(0, 6).map(a => {
-                const epoch = Math.floor((Date.parse(a.published) || 0) / 1000);
-                const when = epoch ? ` · <t:${epoch}:R>` : '';
-                const tag = (a.type && a.type !== 'Story' && a.type !== 'HeadlineNews') ? `**[${a.type}]** ` : '';
-                const href = a.links && a.links.web && a.links.web.href;
-                const title = href ? `[${a.headline}](${href})` : a.headline;
-                return `• ${tag}${title}${when}`;
-            });
-            const embed = new EmbedBuilder()
-                .setColor(0x00AE86)
-                .setTitle(`📰 ${team.displayName} — Latest News`)
-                .setDescription(lines.join('\n').slice(0, 4000))
-                .setFooter({ text: `${lg.name} · headlines via ESPN · tap a headline to read` });
-            const logo = team.logos && team.logos[0] && team.logos[0].href;
-            if (logo) embed.setThumbnail(logo);
-            await interaction.editReply({ embeds: [embed] });
-        } catch (e) {
-            console.error('news command error:', e);
-            await interaction.editReply('Couldn\'t load news right now. Please try again in a moment.');
-        }
-    }
-
-    // ===== WORLD CUP 2026 — TEMPORARY handlers (remove this whole block after the tournament) =====
-    if (commandName === 'wcfixtures') {
-        const norm = (interaction.channel?.name || '').toLowerCase().replace(/[^a-z]/g, '');
-        if (!norm.includes('worldcup')) {
-            return interaction.reply({ content: '⚽ The `/wcfixtures` command can be used in the #worldcup channel.', ephemeral: true });
-        }
-        await interaction.deferReply({ ephemeral: true });
-        try {
-            const events = await wcFixtures();
-            if (!events.length) {
-                return interaction.editReply('No World Cup matches are on the board right now. Try again tomorrow, or use `/livescore` for a specific team.');
-            }
-            const lines = events.map(ev => {
-                const sc = espnScoreLine(ev);
-                const st = (ev.status && ev.status.type) || {};
-                const epoch = Math.floor((Date.parse(ev.date) || 0) / 1000);
-                if (st.state === 'pre') return `🕐 <t:${epoch}:t> — ${sc.an} vs ${sc.hn}`;
-                if (st.state === 'in') {
-                    const clock = [ev.status && ev.status.displayClock, st.shortDetail].filter(Boolean).join(' · ');
-                    return `🔴 ${sc.line}  _(${clock || 'live'})_`;
-                }
-                return `✅ ${sc.line}  _(Final)_`;
-            });
-            const embed = new EmbedBuilder()
-                .setColor(0x6E33D6)
-                .setTitle('⚽ World Cup — Today\'s Matches')
-                .setDescription(lines.join('\n').slice(0, 4000))
-                .addFields({ name: 'Watch live (official)', value: `[FIFA+](${WC_WATCH_LINK}) — or your local rights-holder (US: FOX/Telemundo · UK: BBC/ITV)` })
-                .setFooter({ text: 'Kickoff times show in your local timezone · via ESPN' });
-            await interaction.editReply({ embeds: [embed] });
-        } catch (e) {
-            console.error('wcfixtures error:', e);
-            await interaction.editReply('Couldn\'t load the World Cup schedule right now. Please try again in a moment.');
-        }
-    }
-
-    if (commandName === 'teamstats') {
-        const norm = (interaction.channel?.name || '').toLowerCase().replace(/[^a-z]/g, '');
-        if (!norm.includes('worldcup')) {
-            return interaction.reply({ content: '⚽ The `/teamstats` command can be used in the #worldcup channel.', ephemeral: true });
-        }
-        await interaction.deferReply({ ephemeral: true });
-        try {
-            const events = await wcFixtures();
-            if (!events.length) {
-                return interaction.editReply('No World Cup matches are on the board today. Try `/wcfixtures` to see the schedule.');
-            }
-            const matchupLines = [];
-            const rows = [];
-            let current = new ActionRowBuilder();
-            let count = 0;
-            for (const ev of events) {
-                const comp = (ev.competitions && ev.competitions[0]) || {};
-                const sc = espnScoreLine(ev);
-                const st = (ev.status && ev.status.type) || {};
-                const epoch = Math.floor((Date.parse(ev.date) || 0) / 1000);
-                if (st.state === 'pre') matchupLines.push(`🕐 <t:${epoch}:t> — ${sc.an} vs ${sc.hn}`);
-                else if (st.state === 'in') matchupLines.push(`🔴 ${sc.line} _(live)_`);
-                else matchupLines.push(`✅ ${sc.line} _(Final)_`);
-                for (const c of (comp.competitors || [])) {
-                    if (count >= 25) break;
-                    const t = c.team || {};
-                    const label = (t.displayName || t.shortDisplayName || t.name || 'Team').slice(0, 80);
-                    current.addComponents(
-                        new ButtonBuilder()
-                            .setCustomId(`ts:${ev.id}:${t.id}`)
-                            .setLabel(label)
-                            .setStyle(st.state === 'in' ? ButtonStyle.Success : ButtonStyle.Secondary)
-                    );
-                    count++;
-                    if (current.components.length === 5) { rows.push(current); current = new ActionRowBuilder(); }
-                }
-                if (count >= 25) break;
-            }
-            if (current.components.length) rows.push(current);
-            await interaction.editReply({
-                content: `⚽ **Today's World Cup teams** — tap a team to see its players' **goals, assists & shots on target** so far this World Cup.\n\n${matchupLines.join('\n')}\n\n_Totals are there before kickoff and keep updating live during the game. (A team playing its first match won't have numbers yet.)_`,
-                components: rows.slice(0, 5)
-            });
-        } catch (e) {
-            console.error('teamstats command error:', e);
-            await interaction.editReply('Couldn\'t load today\'s teams right now. Please try again in a moment.');
-        }
-    }
-
-    if (commandName === 'updates') {
-        const norm = (interaction.channel?.name || '').toLowerCase().replace(/[^a-z]/g, '');
-        const isWorldcup = norm.includes('worldcup');
-        const isTools = norm.includes('tools');
-        if (!isWorldcup && !isTools) {
-            return interaction.reply({ content: '⚽ Use `/updates` in the #worldcup channel (soccer) or the #tools channel (all sports).', ephemeral: true });
-        }
-        await interaction.deferReply({ ephemeral: true });
-        try {
-            let pairs;
-            if (isWorldcup) {
-                pairs = (await wcFixtures() || []).map(ev => ({ lg: WC_LEAGUE, ev }));
-            } else {
-                pairs = await todaysGamesAllSports();
-            }
-            const open = pairs.filter(({ ev }) => {
-                const st = (ev.status && ev.status.type && ev.status.type.state) || '';
-                return st === 'pre' || st === 'in';
-            });
-            if (!open.length) {
-                return interaction.editReply(isWorldcup
-                    ? 'There are no upcoming or live World Cup matches today to follow. Check back when today\'s games are on, or use `/wcfixtures` to see the schedule.'
-                    : 'There are no games on today to follow right now. Check back when today\'s games are on.');
-            }
-            open.sort((a, b) => {
-                const ra = espnGameRank(a.ev), rb = espnGameRank(b.ev);     // 0 = live, 1 = upcoming
-                if (ra !== rb) return ra - rb;
-                return (Date.parse(a.ev.date) || 0) - (Date.parse(b.ev.date) || 0);
-            });
-            const options = open.slice(0, 25).map(({ lg, ev }) => {
-                const sc = espnScoreLine(ev);
-                const st = (ev.status && ev.status.type) || {};
-                const live = st.state === 'in';
-                const emo = SPORT_EMOJI[lg.sport] || '•';
-                const desc = isWorldcup
-                    ? (live ? `🔴 Live — ${st.shortDetail || 'in progress'}` : 'Starts later today')
-                    : `${emo} ${lg.name}${live ? ` · 🔴 ${st.shortDetail || 'live'}` : ''}`;
-                return {
-                    label: `${sc.an} vs ${sc.hn}`.slice(0, 100),
-                    description: desc.slice(0, 100),
-                    value: `${lg.key}:${ev.id}`
-                };
-            });
-            const menu = new StringSelectMenuBuilder()
-                .setCustomId('wcwatch')
-                .setPlaceholder(isWorldcup ? 'Pick the match(es) you want goal alerts for' : 'Pick the game(s) you want score alerts for')
-                .setMinValues(1)
-                .setMaxValues(options.length)
-                .addOptions(options);
-            const row = new ActionRowBuilder().addComponents(menu);
-            const blurb = isWorldcup
-                ? '⚽ **Get goal alerts** — choose one or more of today\'s matches below. The moment someone scores, I\'ll ping you right here with the scorer, the assist, and the new score. Pick as many matches as you like.'
-                : '📣 **Get score alerts** — choose one or more of today\'s games below and I\'ll ping you here when the score changes. (Soccer = full goal detail; basketball = end of each quarter + final, so your phone won\'t blow up.)';
-            await interaction.editReply({
-                content: blurb + (open.length > 25 ? '\n\n_Lots of games today — showing the first 25 (live games first)._' : ''),
-                components: [row]
-            });
-        } catch (e) {
-            console.error('updates command error:', e);
-            await interaction.editReply('Couldn\'t load today\'s games right now. Please try again in a moment.');
-        }
-    }
-
-    if (commandName === 'wcstandings') {
-        const norm = (interaction.channel?.name || '').toLowerCase().replace(/[^a-z]/g, '');
-        if (!norm.includes('worldcup')) {
-            return interaction.reply({ content: '⚽ The `/wcstandings` command can be used in the #worldcup channel.', ephemeral: true });
-        }
-        await interaction.deferReply({ ephemeral: true });
-        try {
-            const groups = await wcStandings();
-            if (!groups.length) return interaction.editReply('Group standings aren\'t available yet.');
-            const embed = new EmbedBuilder()
-                .setColor(0x6E33D6)
-                .setTitle('⚽ World Cup — Group Standings')
-                .setFooter({ text: 'Row: # Team  GP  W-D-L  GD  Pts · via ESPN' });
-            for (const g of groups) {
-                const entries = (g.standings && g.standings.entries) || [];
-                const rows = entries.map((en, i) => {
-                    const name = String((en.team && en.team.displayName) || '?').slice(0, 12).padEnd(12);
-                    const gp = wcStat(en.stats, 'gamesPlayed');
-                    const w = wcStat(en.stats, 'wins'), d = wcStat(en.stats, 'ties'), l = wcStat(en.stats, 'losses');
-                    const gd = wcStat(en.stats, 'pointDifferential');
-                    const pts = wcStat(en.stats, 'points');
-                    return `${i + 1} ${name} ${gp}  ${w}-${d}-${l}  ${gd.padStart(3)}  ${pts}p`;
-                });
-                embed.addFields({ name: g.name || 'Group', value: '```\n' + (rows.join('\n') || '—') + '\n```' });
-            }
-            await interaction.editReply({ embeds: [embed] });
-        } catch (e) {
-            console.error('wcstandings error:', e);
-            await interaction.editReply('Couldn\'t load the group standings right now. Please try again in a moment.');
-        }
-    }
-
-    if (commandName === 'wcrecap') {
-        const norm = (interaction.channel?.name || '').toLowerCase().replace(/[^a-z]/g, '');
-        if (!norm.includes('worldcup')) {
-            return interaction.reply({ content: '⚽ The `/wcrecap` command can be used in the #worldcup channel.', ephemeral: true });
-        }
-        const team = options.getString('team');
-        await interaction.deferReply({ ephemeral: true });
-        try {
-            const game = await wcFindRecentGame(team);
-            if (!game) {
-                return interaction.editReply(`I couldn't find a World Cup match for **${team}**. Try the country name — e.g. \`Brazil\`, \`Morocco\`.`);
-            }
-            const summary = await espnSummary(game.lg, game.ev.id);
-            const sc = espnScoreLine(game.ev);
-            const st = (game.ev.status && game.ev.status.type) || {};
-            const epoch = Math.floor((Date.parse(game.ev.date) || 0) / 1000);
+        if (!norm.includes('tools')) {
+            return interaction.reply({ content: '📰 The `/news` command can only be used in the #tools channelth.floor((Date.parse(game.ev.date) || 0) / 1000);
             const head = st.state === 'pre' ? `🗓️ Kicks off <t:${epoch}:F>`
                 : st.state === 'in' ? `🔴 LIVE — ${sc.line}`
                 : `✅ Final — ${sc.line}`;
