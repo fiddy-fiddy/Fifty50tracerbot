@@ -7,7 +7,7 @@
 //   DATABASE_URL (Neon Postgres), PORT (Railway sets this)
 //   BREVO_API_KEY, FROM_EMAIL (for emailing the connect link after payment)
 
-const { Client, GatewayIntentBits, Partials, PermissionFlagsBits, EmbedBuilder, ActionRowBuilder, StringSelectMenuBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+const { Client, GatewayIntentBits, Partials, PermissionFlagsBits, EmbedBuilder, ActionRowBuilder, StringSelectMenuBuilder, ButtonBuilder, ButtonStyle, ModalBuilder, TextInputBuilder, TextInputStyle } = require('discord.js');
 const fs = require('fs');
 const express = require('express');
 const Stripe = require('stripe');
@@ -72,6 +72,8 @@ async function initDb() {
         );
         CREATE INDEX IF NOT EXISTS bot_watches_active_idx ON bot_watches (status, event_id);
         CREATE UNIQUE INDEX IF NOT EXISTS bot_watches_unique_active ON bot_watches (user_id, event_id, player_name, stat_key) WHERE status = 'active';
+        ALTER TABLE bot_watches ALTER COLUMN target_value DROP NOT NULL;
+        ALTER TABLE bot_watches ADD COLUMN IF NOT EXISTS athlete_id TEXT;
         CREATE TABLE IF NOT EXISTS bot_goal_watches (
             id SERIAL PRIMARY KEY,
             user_id TEXT NOT NULL,
@@ -751,7 +753,11 @@ const WATCH_STATS = {
     hkassists: { sport: 'hockey', word: 'assists',       keys: ['assists'] },
     shots:     { sport: 'hockey', word: 'shots on goal', keys: ['shotsTotal'] },
     hkhits:    { sport: 'hockey', word: 'hits',          keys: ['hits'] },
-    saves:     { sport: 'hockey', word: 'saves',         keys: ['saves'] }
+    saves:     { sport: 'hockey', word: 'saves',         keys: ['saves'] },
+    // soccer (World Cup / EPL / UCL / MLS) — per-player stats live in summary.rosters, NOT the box score
+    soccer_goals:   { sport: 'soccer', word: 'goals',           source: 'rosters', rosterStat: 'totalGoals' },
+    soccer_assists: { sport: 'soccer', word: 'assists',         source: 'rosters', rosterStat: 'goalAssists' },
+    soccer_sot:     { sport: 'soccer', word: 'shots on target', source: 'rosters', rosterStat: 'shotsOnTarget' }
 };
 
 // turn a raw box-score cell into a number; for "made-attempted" cells (e.g. 3PT "2-5") take the made count
@@ -767,9 +773,28 @@ function parseStatNumber(raw, madeAtt) {
 // Matches by stable `keys` when provided (baseball/hockey), else by `labels` (basketball).
 // `group` (string or array) restricts which box-score section to read — needed for baseball,
 // where batting and pitching share labels like K/H/HR.
-function readPlayerStat(summary, playerQuery, statKey) {
+function readPlayerStat(summary, playerQuery, statKey, athleteId) {
     const def = WATCH_STATS[statKey];
     if (!def) return null;
+
+    // soccer: per-player stats live in summary.rosters[].roster[].stats, not the box score.
+    if (def.source === 'rosters') {
+        let best = null;
+        for (const r of ((summary && summary.rosters) || [])) {
+            const teamName = r.team && r.team.displayName;
+            for (const p of (r.roster || [])) {
+                const name = p.athlete && p.athlete.displayName;
+                const pid = p.athlete && p.athlete.id;
+                const sc = (athleteId && pid && String(pid) === String(athleteId)) ? 100 : playerMatchScore(playerQuery, name);
+                if (sc <= 0) continue;
+                const val = wcPlayerStat(p, def.rosterStat);
+                const cand = { value: val == null ? 0 : val, player: name, team: teamName, score: sc };
+                if (!best || cand.score > best.score) best = cand;
+            }
+        }
+        return best;
+    }
+
     const groupFilter = def.group ? [].concat(def.group) : null;
     const teams = (summary.boxscore && summary.boxscore.players) || [];
     let best = null;
@@ -788,7 +813,8 @@ function readPlayerStat(summary, playerQuery, statKey) {
             if (idx < 0) continue;
             for (const a of (grp.athletes || [])) {
                 const name = a.athlete && a.athlete.displayName;
-                const sc = playerMatchScore(playerQuery, name);
+                const pid = a.athlete && a.athlete.id;
+                const sc = (athleteId && pid && String(pid) === String(athleteId)) ? 100 : playerMatchScore(playerQuery, name);
                 if (sc <= 0) continue;
                 const val = parseStatNumber((a.stats || [])[idx], def.madeAtt);
                 const cand = { value: val == null ? 0 : val, player: name, team: teamName, score: sc };
@@ -805,39 +831,139 @@ function summaryState(summary) {
     return (comp && comp.status && comp.status.type && comp.status.type.state) || null;
 }
 
-// which ESPN leagues can serve a given stat (by sport); narrow to one league if the user picked
-// a matching one, otherwise scan all leagues of that sport.
-function leaguesForStat(statKey, leagueKey) {
-    const def = WATCH_STATS[statKey];
-    const sport = def && def.sport;
-    const inSport = ESPN_LEAGUES.filter(l => l.sport === sport);
-    if (leagueKey) {
-        const picked = espnLeague(leagueKey);
-        if (picked && picked.sport === sport) return [picked];
+// ---- /watchprop helpers: resolve players from team ROSTERS so a watch can be set BEFORE kickoff ----
+
+// supported sports + the prop menus shown for each (values are unique WATCH_STATS keys)
+const WATCH_SPORTS = [
+    { sport: 'basketball', label: '🏀 Basketball' },
+    { sport: 'baseball',   label: '⚾ Baseball' },
+    { sport: 'hockey',     label: '🏒 Hockey' },
+    { sport: 'soccer',     label: '⚽ Soccer' }
+];
+const WATCH_PROPS = {
+    basketball: [
+        { key: 'points',   label: 'Points' },
+        { key: 'rebounds', label: 'Rebounds' },
+        { key: 'assists',  label: 'Assists' },
+        { key: 'threes',   label: '3-Pointers' },
+        { key: 'steals',   label: 'Steals' },
+        { key: 'blocks',   label: 'Blocks' }
+    ],
+    baseball: [
+        { key: 'homeruns',   label: 'Home Runs' },
+        { key: 'hits',       label: 'Hits' },
+        { key: 'rbis',       label: 'RBIs' },
+        { key: 'runs',       label: 'Runs' },
+        { key: 'strikeouts', label: 'Strikeouts (pitcher)' }
+    ],
+    hockey: [
+        { key: 'goals',     label: 'Goals' },
+        { key: 'hkassists', label: 'Assists' },
+        { key: 'shots',     label: 'Shots on Goal' },
+        { key: 'hkhits',    label: 'Hits' },
+        { key: 'saves',     label: 'Saves (goalie)' }
+    ],
+    soccer: [
+        { key: 'soccer_goals',   label: 'Goals' },
+        { key: 'soccer_assists', label: 'Assists' },
+        { key: 'soccer_sot',     label: 'Shots on Target' }
+    ]
+};
+const leaguesForSport = sport => ESPN_LEAGUES.filter(l => l.sport === sport);
+
+// a team's roster (athletes w/ id + name). ESPN returns athletes either flat or grouped (athletes[].items).
+// works for every sport BEFORE the game starts, so we can resolve a player pre-kickoff. cached 6h.
+async function teamRoster(lg, teamId) {
+    const data = await espnGet(`${ESPN_BASE}/${lg.sport}/${lg.league}/teams/${teamId}/roster`, 6 * 60 * 60 * 1000);
+    const groups = (data && data.athletes) || [];
+    const flat = (Array.isArray(groups) && groups[0] && groups[0].items)
+        ? groups.flatMap(g => g.items || [])
+        : groups;
+    const out = [];
+    for (const a of (flat || [])) {
+        const id = a && a.id;
+        const name = a && (a.displayName || a.fullName);
+        if (id && name) out.push({ id: String(id), name });
     }
-    return inSport;
+    return out;
 }
 
-// find a LIVE game that currently shows this player in its box score
-async function findPlayerWatchGame(playerQuery, leagueKey, statKey) {
-    const leagues = leaguesForStat(statKey, leagueKey);
-    let best = null;
-    for (const lg of leagues) {
+// which supported sports have a game today that hasn't finished yet? -> [{sport,label}]
+async function sportsPlayingToday() {
+    const out = [];
+    for (const s of WATCH_SPORTS) {
+        let has = false;
+        await Promise.all(leaguesForSport(s.sport).map(async lg => {
+            try {
+                const events = await espnScoreboard(lg);
+                if (events.some(ev => ['pre', 'in'].includes(ev.status && ev.status.type && ev.status.type.state))) has = true;
+            } catch (e) {}
+        }));
+        if (has) out.push(s);
+    }
+    return out;
+}
+
+// every athlete on a team playing today in this sport -> one candidate per athlete
+async function watchCandidatesForSport(sport) {
+    const games = [];
+    for (const lg of leaguesForSport(sport)) {
         let events;
         try { events = await espnScoreboard(lg); } catch (e) { continue; }
         for (const ev of events) {
             const state = ev.status && ev.status.type && ev.status.type.state;
-            if (state !== 'in') continue; // box scores only exist once a game is live
-            let summary;
-            try { summary = await espnSummary(lg, ev.id); } catch (e) { continue; }
-            const hit = readPlayerStat(summary, playerQuery, statKey);
-            if (!hit) continue;
-            const cand = { lg, ev, player: hit.player, value: hit.value, score: hit.score };
-            if (!best || cand.score > best.score) best = cand;
+            if (!['pre', 'in'].includes(state)) continue;
+            const comp = (ev.competitions && ev.competitions[0]) || {};
+            const competitors = comp.competitors || [];
+            const eventName = ev.name || ev.shortName ||
+                competitors.map(c => c.team && (c.team.displayName || c.team.abbreviation)).filter(Boolean).join(' vs ');
+            for (const c of competitors) {
+                const t = c.team;
+                if (t && t.id) games.push({ lg, evId: String(ev.id), eventName, state, teamId: String(t.id), teamName: (t.displayName || t.shortDisplayName || '') });
+            }
         }
-        if (best && best.score >= 90) break;
     }
-    return best;
+    const fetched = await Promise.all(games.map(async g => {
+        try { return { g, players: await teamRoster(g.lg, g.teamId) }; }
+        catch (e) { return { g, players: [] }; }
+    }));
+    const cands = [];
+    for (const { g, players } of fetched) {
+        for (const p of players) {
+            cands.push({ lgKey: g.lg.key, eventId: g.evId, eventName: g.eventName, eventState: g.state, teamName: g.teamName, athleteId: p.id, name: p.name });
+        }
+    }
+    return cands;
+}
+
+function rankWatchCandidates(cands, query) {
+    return cands
+        .map(c => ({ c, score: playerMatchScore(query, c.name) }))
+        .filter(x => x.score > 0)
+        .sort((a, b) => b.score - a.score)
+        .map(x => x.c);
+}
+
+// short-lived state for the click-through (sport -> player -> prop). token -> state, 10-min TTL.
+const pendingWatchFlows = new Map();
+const WATCH_FLOW_TTL = 10 * 60 * 1000; // a setup expires 10 min after its last step
+function prunePendingWatchFlows() {
+    const cutoff = Date.now() - WATCH_FLOW_TTL;
+    for (const [k, v] of pendingWatchFlows) if (v.at < cutoff) pendingWatchFlows.delete(k);
+    // hard cap so a flood of abandoned setups can't grow the map without bound
+    if (pendingWatchFlows.size > 500) {
+        const oldest = [...pendingWatchFlows.entries()].sort((a, b) => a[1].at - b[1].at);
+        for (let i = 0; i < oldest.length - 500; i++) pendingWatchFlows.delete(oldest[i][0]);
+    }
+}
+const newWatchToken = () => Math.random().toString(36).slice(2, 10);
+// return a flow only if it exists, hasn't expired, and belongs to this user; drop it if expired
+function getWatchFlow(token, userId) {
+    const s = pendingWatchFlows.get(token);
+    if (!s) return null;
+    if (s.at < Date.now() - WATCH_FLOW_TTL) { pendingWatchFlows.delete(token); return null; }
+    if (userId && s.userId !== userId) return null;
+    return s;
 }
 
 // DM a user by id, swallowing errors (closed DMs etc.) so the poller never crashes
@@ -870,13 +996,15 @@ async function pollWatches() {
                     try {
                         const def = WATCH_STATS[w.stat_key];
                         const word = def ? def.word : w.stat_key;
-                        const hit = readPlayerStat(summary, w.player_name, w.stat_key);
+                        const hit = readPlayerStat(summary, w.player_name, w.stat_key, w.athlete_id);
                         const cur = hit ? hit.value : w.last_value;
+                        const hasTarget = w.target_value != null;
                         if (hit && cur > w.last_notified_value) {
-                            const justHit = cur >= w.target_value && w.last_notified_value < w.target_value;
-                            const msg = justHit
-                                ? `🎯 **${w.player_name}** hit **${cur} ${word}** — that clears your target of **${w.target_value}**! (${w.event_name})`
-                                : `📈 **${w.player_name}** is up to **${cur} ${word}** (target ${w.target_value}) — ${w.event_name}`;
+                            const justHit = hasTarget && cur >= w.target_value && w.last_notified_value < w.target_value;
+                            let msg;
+                            if (justHit) msg = `🎯 **${w.player_name}** hit **${cur} ${word}** — that clears your target of **${w.target_value}**! (${w.event_name})`;
+                            else if (hasTarget) msg = `📈 **${w.player_name}** is up to **${cur} ${word}** (target ${w.target_value}) — ${w.event_name}`;
+                            else msg = `📈 **${w.player_name}** is up to **${cur} ${word}** — ${w.event_name}`;
                             await dmUser(w.user_id, msg);
                             await dbQuery(`UPDATE bot_watches SET last_value=$1, last_notified_value=$1, updated_at=NOW() WHERE id=$2`, [cur, w.id]);
                         } else if (hit && cur !== w.last_value) {
@@ -884,20 +1012,163 @@ async function pollWatches() {
                         }
                         if (state === 'post') {
                             const finalVal = hit ? hit.value : w.last_value;
-                            const verdict = finalVal >= w.target_value ? 'cleared ✅' : 'came up short ❌';
-                            await dmUser(w.user_id, `🏁 Final — **${w.player_name}** finished with **${finalVal} ${word}** (target ${w.target_value}). Your watch ${verdict}. (${w.event_name})`);
+                            let msg;
+                            if (hasTarget) {
+                                const verdict = finalVal >= w.target_value ? 'cleared ✅' : 'came up short ❌';
+                                msg = `🏁 Final — **${w.player_name}** finished with **${finalVal} ${word}** (target ${w.target_value}). Your watch ${verdict}. (${w.event_name})`;
+                            } else {
+                                msg = `🏁 Final — **${w.player_name}** finished with **${finalVal} ${word}**. (${w.event_name})`;
+                            }
+                            await dmUser(w.user_id, msg);
                             await dbQuery(`UPDATE bot_watches SET status='done', last_value=$1, updated_at=NOW() WHERE id=$2`, [finalVal, w.id]);
                         }
                     } catch (e) { console.error('watch row error:', e.message); }
                 }
             }
         }
-        // close out anything active too long (e.g. a game that never resolved cleanly)
-        await dbQuery(`UPDATE bot_watches SET status='done', updated_at=NOW() WHERE status='active' AND created_at < NOW() - INTERVAL '8 hours'`);
+        // close out anything active too long. 24h (not 8h) so a watch set hours BEFORE a later
+        // game today isn't killed before that game even kicks off — finals are handled on 'post' above.
+        await dbQuery(`UPDATE bot_watches SET status='done', updated_at=NOW() WHERE status='active' AND created_at < NOW() - INTERVAL '24 hours'`);
     } catch (e) {
         console.error('pollWatches error:', e.message);
     } finally {
         watchPollRunning = false;
+    }
+}
+
+// ---- /watchprop interactive flow: pick sport -> type player -> pick prop (works pre-game) ----
+
+// sport button -> pop a modal asking for the player's name (+ optional target number)
+async function handleWatchSportButton(interaction) {
+    const sport = interaction.customId.split(':')[2];
+    const modal = new ModalBuilder().setCustomId(`wp:modal:${sport}`).setTitle('Who do you want to watch?');
+    const nameInput = new TextInputBuilder()
+        .setCustomId('player').setLabel('Player name (or close to it)')
+        .setPlaceholder('e.g. LeBron James').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(60);
+    const targetInput = new TextInputBuilder()
+        .setCustomId('target').setLabel('Target number (optional)')
+        .setPlaceholder('e.g. 25 — leave blank to just track it').setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(4);
+    modal.addComponents(
+        new ActionRowBuilder().addComponents(nameInput),
+        new ActionRowBuilder().addComponents(targetInput)
+    );
+    await interaction.showModal(modal);
+}
+
+// show the per-sport prop menu for the chosen player
+async function sendPropPicker(interaction, token, idx) {
+    const state = pendingWatchFlows.get(token);
+    if (!state) return interaction.editReply({ content: '⌛ That setup expired — run `/watchprop` again.', components: [] });
+    state.chosenIdx = idx;
+    state.at = Date.now();
+    const chosen = state.matches[idx];
+    const props = WATCH_PROPS[state.sport] || [];
+    const menu = new StringSelectMenuBuilder()
+        .setCustomId(`wp:prop:${token}`)
+        .setPlaceholder('Pick the stat to watch')
+        .addOptions(props.map(p => ({ label: p.label, value: p.key })));
+    const where = chosen.eventName ? ` in **${chosen.eventName}**` : '';
+    const tline = state.target != null ? ` — I'll ping you when they hit **${state.target}+**` : '';
+    await interaction.editReply({
+        content: `✅ Player: **${chosen.name}**${chosen.teamName ? ` (${chosen.teamName})` : ''}${where}.\nNow pick the stat to watch${tline}:`,
+        components: [new ActionRowBuilder().addComponents(menu)]
+    });
+}
+
+// modal submitted -> resolve the typed name against today's rosters, then pick player or prop
+async function handleWatchModalSubmit(interaction) {
+    const sport = interaction.customId.split(':')[2];
+    const query = (interaction.fields.getTextInputValue('player') || '').trim();
+    const rawTarget = (interaction.fields.getTextInputValue('target') || '').trim();
+    await interaction.deferReply({ ephemeral: true });
+    // blank target = just track every climb; a non-blank target must be a whole number >= 1
+    let target = null;
+    if (rawTarget) {
+        if (!/^[0-9]+$/.test(rawTarget) || parseInt(rawTarget, 10) < 1) {
+            return interaction.editReply(`"${rawTarget}" isn't a valid target. Enter a whole number like **25**, or leave it blank to just track every climb.`);
+        }
+        target = parseInt(rawTarget, 10);
+    }
+    try {
+        const cands = await watchCandidatesForSport(sport);
+        const matches = rankWatchCandidates(cands, query).slice(0, 25);
+        if (!matches.length) {
+            return interaction.editReply(`I couldn't find a player like **${query}** in today's ${sport} games. Double-check the spelling — or they may not be playing today.`);
+        }
+        prunePendingWatchFlows();
+        const token = newWatchToken();
+        pendingWatchFlows.set(token, { at: Date.now(), userId: interaction.user.id, sport, target, matches });
+        const strong = matches.filter(m => playerMatchScore(query, m.name) >= 85);
+        if (matches.length === 1 || strong.length === 1) {
+            const chosen = matches.length === 1 ? matches[0] : strong[0];
+            return sendPropPicker(interaction, token, matches.indexOf(chosen));
+        }
+        const menu = new StringSelectMenuBuilder()
+            .setCustomId(`wp:player:${token}`)
+            .setPlaceholder('Pick the right player')
+            .addOptions(matches.slice(0, 25).map((m, i) => {
+                const opt = { label: (m.name || 'Player').slice(0, 100), value: String(i) };
+                const desc = `${m.teamName || ''}${m.eventName ? ' — ' + m.eventName : ''}`.trim();
+                if (desc) opt.description = desc.slice(0, 100);
+                return opt;
+            }));
+        await interaction.editReply({ content: `Found a few players like **${query}** — which one?`, components: [new ActionRowBuilder().addComponents(menu)] });
+    } catch (e) {
+        console.error('watchprop modal error:', e);
+        await interaction.editReply('Something went wrong finding that player. Please try again in a moment.');
+    }
+}
+
+// player chosen from the disambiguation menu -> show the prop menu
+async function handleWatchPlayerSelect(interaction) {
+    const token = interaction.customId.split(':')[2];
+    const state = getWatchFlow(token, interaction.user.id);
+    if (!state) {
+        return interaction.update({ content: '⌛ That setup expired — run `/watchprop` again.', components: [] }).catch(() => {});
+    }
+    const idx = parseInt(interaction.values[0], 10);
+    await interaction.deferUpdate();
+    return sendPropPicker(interaction, token, idx);
+}
+
+// prop chosen -> save the watch (works pre-game; the poller starts DMing once the game is live)
+async function handleWatchPropSelect(interaction) {
+    const token = interaction.customId.split(':')[2];
+    const state = getWatchFlow(token, interaction.user.id);
+    if (!state) {
+        return interaction.update({ content: '⌛ That setup expired — run `/watchprop` again.', components: [] }).catch(() => {});
+    }
+    const statKey = interaction.values[0];
+    const def = WATCH_STATS[statKey];
+    const chosen = state.matches[state.chosenIdx != null ? state.chosenIdx : 0];
+    await interaction.deferUpdate();
+    try {
+        const lg = espnLeague(chosen.lgKey);
+        const word = def ? def.word : statKey;
+        const target = state.target;
+        await dbQuery(
+            `INSERT INTO bot_watches (user_id, league_key, event_id, event_name, player_name, stat_key, target_value, last_value, last_notified_value, status, athlete_id)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,0,0,'active',$8)
+             ON CONFLICT (user_id, event_id, player_name, stat_key) WHERE status = 'active'
+             DO UPDATE SET target_value = EXCLUDED.target_value, athlete_id = EXCLUDED.athlete_id, updated_at = NOW()`,
+            [interaction.user.id, chosen.lgKey, chosen.eventId, chosen.eventName, chosen.name, statKey, target, chosen.athleteId]
+        );
+        pendingWatchFlows.delete(token);
+        const lgName = lg ? lg.name : '';
+        const pre = chosen.eventState === 'pre';
+        const targetLine = target != null
+            ? `I'll DM you the moment they hit **${target}+ ${word}**`
+            : `I'll DM you each time their **${word}** goes up`;
+        const startLine = pre
+            ? `The game hasn't started yet — I'll start tracking the second it kicks off.`
+            : `The game's already on — I'll start tracking right now.`;
+        await interaction.editReply({
+            content: `✅ **Watching ${chosen.name}** for **${word}** in **${chosen.eventName}**${lgName ? ` (${lgName})` : ''}.\n${targetLine}, plus a final result when the game ends.\n${startLine}\n\n_Make sure your DMs are open so I can reach you!_`,
+            components: []
+        });
+    } catch (e) {
+        console.error('watchprop prop select error:', e);
+        await interaction.editReply({ content: 'Something went wrong saving that watch. Please try again in a moment.', components: [] });
     }
 }
 
@@ -1158,268 +1429,10 @@ async function handleWcWatchSelect(interaction) {
             confirmed.push(line);
         }
         if (!confirmed.length) return interaction.editReply('Hmm, I couldn\'t set that up — please run `/updates` again.');
-        const liveNote = anyLive
-            ? '\n\n_That game\'s already underway, so the score above is where things stand right now. I\'ll ping you on the **next** goal/score change — not the ones that already happened._'
-            : '';
-        await interaction.editReply(`✅ You're all set! I'll ping you right here when there's action in:\n${confirmed.join('\n')}${liveNote}\n\nTap **Stop alerts** on any alert (or run \`/updates\` again) to turn them off. Alerts stop automatically when the game ends.`);
-    } catch (e) {
-        console.error('wcwatch select error:', e);
-        await interaction.editReply('Something went wrong setting up your alerts. Please try `/updates` again.');
-    }
-}
-
-// the "Stop alerts" button cancels only the clicking user's watch for that match
-async function handleWcStopButton(interaction) {
-    const eventId = (interaction.customId.split(':')[1]) || '';
-    try {
-        const res = await dbQuery(
-            `UPDATE bot_goal_watches SET status='cancelled', updated_at=NOW() WHERE user_id=$1 AND event_id=$2 AND status='active'`,
-            [interaction.user.id, eventId]
-        );
-        if (res.rowCount > 0) {
-            await interaction.reply({ content: '🔕 Done — you won\'t get any more goal alerts for that match.', ephemeral: true });
-        } else {
-            await interaction.reply({ content: 'You weren\'t following that match (it may have already ended).', ephemeral: true });
-        }
-    } catch (e) {
-        console.error('wcstop button error:', e);
-        await interaction.reply({ content: 'Couldn\'t update that just now — please try again in a moment.', ephemeral: true });
-    }
-}
-
-// ===== WORLD CUP 2026 — TEMPORARY helpers (remove this whole block after the tournament) =====
-const WC_LEAGUE = espnLeague('wc'); // soccer / fifa.world
-const WC_WATCH_LINK = 'https://www.fifa.com/fifaplus/en/home'; // official & legal; broadcast rights vary by country
-
-// pull one standings stat as its display string (e.g. points, pointDifferential "+2")
-function wcStat(stats, name) {
-    const s = (stats || []).find(x => x.name === name);
-    return s ? String(s.displayValue != null ? s.displayValue : s.value) : '0';
-}
-
-// Build a YYYYMMDD date string in the community's timezone (US Eastern) so evening
-// games don't roll over to "tomorrow" the way a raw UTC date would.
-function espnDateET(date = new Date()) {
-    return new Intl.DateTimeFormat('en-CA', {
-        timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit'
-    }).format(date).replace(/-/g, '');
-}
-
-// today's (US Eastern) World Cup fixtures; fall back to the current matchday board if today is empty
-async function wcFixtures() {
-    const ymd = espnDateET();
-    let events = [];
-    try { const d = await espnGet(`${ESPN_BASE}/soccer/fifa.world/scoreboard?dates=${ymd}`, 20000); events = (d && d.events) || []; } catch (e) {}
-    if (!events.length && WC_LEAGUE) { try { events = await espnScoreboard(WC_LEAGUE); } catch (e) {} }
-    return events;
-}
-
-// all World Cup group tables
-async function wcStandings() {
-    const d = await espnGet('https://site.api.espn.com/apis/v2/sports/soccer/fifa.world/standings', 60000);
-    return (d && d.children) || [];
-}
-
-// goals + cards (in match order) from a summary's keyEvents
-function wcMatchEvents(summary) {
-    const ke = (summary && summary.keyEvents) || [];
-    const keep = /goal|penalty|red card|yellow card/i;
-    const out = [];
-    for (const e of ke) {
-        const type = (e.type && (e.type.text || e.type.id)) || '';
-        if (!keep.test(type)) continue;
-        out.push({
-            type,
-            clock: (e.clock && e.clock.displayValue) || '',
-            team: (e.team && (e.team.displayName || e.team.abbreviation)) || '',
-            players: (e.participants || []).map(p => p.athlete && p.athlete.displayName).filter(Boolean)
-        });
-    }
-    return out;
-}
-// /wcrecap needs a team's LATEST match, which may be on an earlier matchday. The default
-// scoreboard only shows the current matchday, so scan recent dated boards (and tomorrow).
-async function wcFindRecentGame(query) {
-    if (!WC_LEAGUE) return null;
-    const ms = 86400000, now = Date.now();
-    const recapRank = ev => { const s = ev.status && ev.status.type && ev.status.type.state; return s === 'in' ? 0 : s === 'post' ? 1 : 2; };
-    let best = null;
-    for (let off = 1; off >= -10; off--) {
-        const ymd = espnDateET(new Date(now + off * ms));
-        let events = [];
-        try { const d = await espnGet(`${ESPN_BASE}/soccer/fifa.world/scoreboard?dates=${ymd}`, 60000); events = (d && d.events) || []; } catch (e) { continue; }
-        for (const ev of events) {
-            const score = espnTeamScore(query, ev);
-            if (score < 80) continue;
-            const cand = { lg: WC_LEAGUE, ev, score, rank: recapRank(ev), when: Date.parse(ev.date) || 0 };
-            if (!best) { best = cand; continue; }
-            if (cand.score !== best.score) { if (cand.score > best.score) best = cand; }
-            else if (cand.rank !== best.rank) { if (cand.rank < best.rank) best = cand; }
-            else if (cand.rank === 2) { if (cand.when < best.when) best = cand; } // soonest upcoming
-            else { if (cand.when > best.when) best = cand; }                       // most recent live/finished
-        }
-        if (best && best.rank === 0) break; // a live match wins outright
-    }
-    return best;
-}
-
-// /teamstats — read one soccer player's stat value by ESPN stat name (totalGoals / goalAssists / shotsOnTarget)
-function wcPlayerStat(player, name) {
-    const s = ((player && player.stats) || []).find(x => x.name === name);
-    if (!s) return 0;
-    const v = s.value != null ? s.value : parseFloat(s.displayValue);
-    return Number.isFinite(v) ? v : 0;
-}
-
-// /teamstats — read the state ('pre' | 'in' | 'post') from a team-schedule event
-function wcEventState(ev) {
-    const st = ((((ev || {}).competitions || [])[0] || {}).status) || (ev && ev.status) || {};
-    return (st.type && st.type.state) || null;
-}
-
-// /teamstats — a member tapped a team button: show that team's players with their
-// World Cup-so-far totals (goals, assists, shots on target) added up across every match
-// the team has played. This means the numbers are useful BEFORE kickoff (form going in)
-// and keep climbing live while today's match is being played.
-async function handleTeamStatsButton(interaction) {
-    const parts = interaction.customId.split(':');
-    const todayEventId = parts[1] || '';
-    const teamId = parts[2] || '';
-    await interaction.deferReply({ ephemeral: true });
-    try {
-        // today's match → opponent + status (also a stat source if it's live/finished)
-        let todaySummary = null;
-        try { todaySummary = await espnSummary(WC_LEAGUE, todayEventId); } catch (e) {}
-        const tComp = (((todaySummary || {}).header || {}).competitions || [])[0] || {};
-        const tCompetitors = tComp.competitors || [];
-        const meC = tCompetitors.find(c => c.team && String(c.team.id) === String(teamId));
-        const oppC = tCompetitors.find(c => c.team && String(c.team.id) !== String(teamId));
-        const oppName = (oppC && oppC.team && (oppC.team.displayName || oppC.team.shortDisplayName)) || 'opponent';
-        const todayState = summaryState(todaySummary) || null;
-        const epoch = Math.floor((Date.parse(tComp.date) || 0) / 1000);
-
-        // the team's World Cup schedule (one call) → which matches to total up
-        let sched = null, schedFailed = false;
-        try { sched = await espnGet(`${ESPN_BASE}/soccer/fifa.world/teams/${teamId}/schedule`, 60000); } catch (e) { schedFailed = true; }
-        if (!sched) schedFailed = true;
-        const teamName = (sched && sched.team && sched.team.displayName)
-            || (meC && meC.team && meC.team.displayName) || 'This team';
-
-        // event ids to total: every played/live match on the schedule, plus today if it's underway/finished
-        const ids = new Map();
-        let anyLive = todayState === 'in';
-        for (const e of ((sched && sched.events) || [])) {
-            const s = wcEventState(e);
-            if (s === 'in' || s === 'post') ids.set(String(e.id), true);
-            if (s === 'in') anyLive = true;
-        }
-        if (todayState === 'in' || todayState === 'post') ids.set(String(todayEventId), true);
-
-        // context line about today's match
-        let context = '';
-        if (todayState === 'in') context = `_Today: vs ${oppName} · 🔴 live now_`;
-        else if (todayState === 'pre') context = `_Today: vs ${oppName}${epoch ? ` · kickoff <t:${epoch}:t>` : ''}_`;
-        else if (todayState === 'post') context = `_Today: vs ${oppName} · ✅ final_`;
-
-        if (!ids.size) {
-            // if we couldn't even load the schedule (and today isn't live/finished), say so rather than implying they haven't played
-            if (schedFailed && todayState !== 'in' && todayState !== 'post') {
-                return interaction.editReply(
-                    `⚽ Couldn't load **${teamName}**'s World Cup history right now.` +
-                    (context ? `\n${context}` : '') +
-                    `\n\nPlease try again in a moment.`
-                );
-            }
-            return interaction.editReply(
-                `⚽ **${teamName}** — first game, no stats yet.` +
-                (context ? `\n${context}` : '') +
-                `\n\n_Player stats show up once they kick off, then keep updating live during the match._`
-            );
-        }
-
-        // total the three stats per player across those matches
-        const agg = new Map(); // athleteId -> { name, g, a, sot }
-        for (const id of ids.keys()) {
-            let summary = (id === String(todayEventId) && todaySummary) ? todaySummary : null;
-            if (!summary) { try { summary = await espnSummary(WC_LEAGUE, id); } catch (e) { continue; } }
-            const r = ((summary && summary.rosters) || []).find(x => x.team && String(x.team.id) === String(teamId));
-            if (!r) continue;
-            for (const p of (r.roster || [])) {
-                if (!(p.starter || p.subbedIn || wcPlayerStat(p, 'appearances') >= 1)) continue;
-                const aid = p.athlete && p.athlete.id;
-                const name = p.athlete && p.athlete.displayName;
-                if (!aid || !name) continue;
-                const cur = agg.get(aid) || { name, g: 0, a: 0, sot: 0 };
-                cur.g += wcPlayerStat(p, 'totalGoals');
-                cur.a += wcPlayerStat(p, 'goalAssists');
-                cur.sot += wcPlayerStat(p, 'shotsOnTarget');
-                agg.set(aid, cur);
-            }
-        }
-
-        const players = [...agg.values()]
-            .sort((x, y) => (y.g * 100 + y.a * 10 + y.sot) - (x.g * 100 + x.a * 10 + x.sot) || x.name.localeCompare(y.name));
-        const lines = players.map(p => `⚽ ${p.g} · 🅰️ ${p.a} · 🎯 ${p.sot} — **${p.name}**`);
-        const matchWord = ids.size === 1 ? '1 match' : `${ids.size} matches`;
-        const liveNote = anyLive ? '  ·  🔴 includes today\'s live match' : '';
-        const header = (context ? `${context}\n\n` : '') +
-            `📊 **World Cup so far** (${matchWord})${liveNote}\n` +
-            `⚽ goals · 🅰️ assists · 🎯 shots on target\n`;
-        const body = lines.length ? lines.join('\n') : 'No goals, assists, or shots on target recorded yet.';
-        const embed = new EmbedBuilder()
-            .setColor(0x6E33D6)
-            .setTitle(`⚽ ${teamName} — Player Stats`)
-            .setDescription((header + '\n' + body).slice(0, 4000))
-            .setFooter({ text: 'World Cup totals · updates live · via ESPN' });
-        await interaction.editReply({ embeds: [embed] });
-    } catch (e) {
-        console.error('teamstats button error:', e);
-        await interaction.editReply('Couldn\'t load those player stats right now. Please try again in a moment.');
-    }
-}
-// ===== end World Cup temporary helpers =====
-
-// ====== BOT READY & COMMAND REGISTRATION ======
-client.once('ready', async () => {
-    console.log(`${client.user.tag} is online!`);
-    try { await initDb(); } catch (e) { console.error('DB init failed:', e); }
-
-    // Auto-sweep DISABLED on purpose. It kicked EVERY member without the PAID role,
-    // including the owner's friends/staff and customers who had paid but not yet
-    // clicked their Discord connect link. Removal now happens only via Stripe
-    // webhooks (cancel / refund / dispute), which is precise and safe.
-    // sweepUnpaidMembers();
-    // setInterval(sweepUnpaidMembers, 6 * 60 * 60 * 1000);
-
-    // Most commands are open to all members. Only /parlay stays admin-only via
-    // defaultMemberPermissions. Members can use /follow, /unfollow, /following, /feed,
-    // /alerts, /stats, /linehistory, /livescore, /reports and /watchprop.
-    const ADMIN_ONLY = PermissionFlagsBits.ManageGuild;
-    const espnLeagueChoices = ESPN_LEAGUES.map(l => ({ name: l.name, value: l.key }));
-    const data = [
-        { name: 'follow', description: 'Follow a bettor', options: [{ name: 'target', type: 6, description: 'User to follow', required: true }] },
-        { name: 'unfollow', description: 'Stop following a bettor', options: [{ name: 'target', type: 6, description: 'User to unfollow', required: true }] },
-        { name: 'following', description: 'See who you are following' },
-        { name: 'feed', description: 'See recent slips from users you follow' },
-        { name: 'alerts', description: 'Turn DM alerts on or off', options: [{ name: 'state', type: 3, description: 'on or off', required: true }] },
-        { name: 'stats', description: 'Look up player or team sports stats (members chat only)', options: [{ name: 'question', type: 3, description: 'e.g. LeBron points this season, or Lakers record this season', required: true }] },
-        { name: 'linehistory', description: 'Show how a team or player\'s odds have moved (members chat only)', options: [
-            { name: 'team', type: 3, description: 'Team OR player name — e.g. Lakers, Wembanyama, Salah', required: true },
-            { name: 'league', type: 3, description: 'Optional: narrow the search to one league', required: false, choices: [
-                { name: 'MLB', value: 'mlb' },
-                { name: 'NBA', value: 'nba' },
-                { name: 'NHL', value: 'nhl' },
-                { name: 'WNBA', value: 'wnba' },
-                { name: 'NFL', value: 'nfl' },
-                { name: 'College Football', value: 'ncaaf' },
-                { name: 'College Basketball', value: 'ncaab' },
-         const stopRow = new ActionRowBuilder().addComponents(
-            new ButtonBuilder().setCustomId('updstopall').setLabel('Stop all my alerts').setStyle(ButtonStyle.Danger).setEmoji('🔕')
-        );
-        await interaction.editReply({
-            content: `✅ You're all set! I'll ping you right here when there's action in:\n${confirmed.join('\n')}${liveNote}\n\nTap **Stop all my alerts** below to turn them all off at once (or **Stop alerts** on an individual alert). Alerts also stop automatically when the game ends.`,
-            components: [stopRow]
-        });
+        const liveNote = anyLive ? '\n\n_That game\'s already underway, so the score above is where things stand right now. I\'ll ping you on the **next** goal/score change — not the ones that already happened._' : '';
+        const stopRow = new ActionRowBuilder().addComponents(new ButtonBuilder().setCustomId('updstopall').setLabel('Stop all my alerts').setStyle(ButtonStyle.Danger).setEmoji('🔕'));
+        const setMsg = `✅ You're all set! I'll ping you right here when there's action in:\n${confirmed.join('\n')}${liveNote}\n\nTap **Stop all my alerts** below to turn them all off at once (or **Stop alerts** on an individual alert). Alerts also stop automatically when the game ends.`;
+        await interaction.editReply({ content: setMsg, components: [stopRow] });
     } catch (e) {
         console.error('wcwatch select error:', e);
         await interaction.editReply('Something went wrong setting up your alerts. Please try `/updates` again.');
@@ -2185,7 +2198,239 @@ client.on('interactionCreate', async interaction => {
     if (commandName === 'news') {
         const norm = (interaction.channel?.name || '').toLowerCase().replace(/[^a-z]/g, '');
         if (!norm.includes('tools')) {
-            return interaction.reply({ content: '📰 The `/news` command can only be used in the #tools channelth.floor((Date.parse(game.ev.date) || 0) / 1000);
+            return interaction.reply({ content: '📰 The `/news` command can only be used in the #tools channel.', ephemeral: true });
+        }
+        const teamQuery = options.getString('team');
+        const leagueKey = options.getString('league') || null;
+        await interaction.deferReply({ ephemeral: norm.includes('tools') });
+        try {
+            const match = await findEspnTeam(teamQuery, leagueKey);
+            if (!match) {
+                return interaction.editReply(`I couldn't find a team called **${teamQuery}**. Try the team name or city — e.g. \`Lakers\`, \`Yankees\`, \`Chiefs\` — or pick a **league** from the list.`);
+            }
+            const { lg, team } = match;
+            const articles = await espnTeamNews(lg, team.id);
+            if (!articles.length) {
+                return interaction.editReply(`No recent headlines for **${team.displayName}** right now. Check back later, or try a **league** filter.`);
+            }
+            const lines = articles.slice(0, 6).map(a => {
+                const epoch = Math.floor((Date.parse(a.published) || 0) / 1000);
+                const when = epoch ? ` · <t:${epoch}:R>` : '';
+                const tag = (a.type && a.type !== 'Story' && a.type !== 'HeadlineNews') ? `**[${a.type}]** ` : '';
+                const href = a.links && a.links.web && a.links.web.href;
+                const title = href ? `[${a.headline}](${href})` : a.headline;
+                return `• ${tag}${title}${when}`;
+            });
+            const embed = new EmbedBuilder()
+                .setColor(0x00AE86)
+                .setTitle(`📰 ${team.displayName} — Latest News`)
+                .setDescription(lines.join('\n').slice(0, 4000))
+                .setFooter({ text: `${lg.name} · headlines via ESPN · tap a headline to read` });
+            const logo = team.logos && team.logos[0] && team.logos[0].href;
+            if (logo) embed.setThumbnail(logo);
+            await interaction.editReply({ embeds: [embed] });
+        } catch (e) {
+            console.error('news command error:', e);
+            await interaction.editReply('Couldn\'t load news right now. Please try again in a moment.');
+        }
+    }
+
+    // ===== WORLD CUP 2026 — TEMPORARY handlers (remove this whole block after the tournament) =====
+    if (commandName === 'wcfixtures') {
+        const norm = (interaction.channel?.name || '').toLowerCase().replace(/[^a-z]/g, '');
+        if (!norm.includes('worldcup')) {
+            return interaction.reply({ content: '⚽ The `/wcfixtures` command can be used in the #worldcup channel.', ephemeral: true });
+        }
+        await interaction.deferReply({ ephemeral: true });
+        try {
+            const events = await wcFixtures();
+            if (!events.length) {
+                return interaction.editReply('No World Cup matches are on the board right now. Try again tomorrow, or use `/livescore` for a specific team.');
+            }
+            const lines = events.map(ev => {
+                const sc = espnScoreLine(ev);
+                const st = (ev.status && ev.status.type) || {};
+                const epoch = Math.floor((Date.parse(ev.date) || 0) / 1000);
+                if (st.state === 'pre') return `🕐 <t:${epoch}:t> — ${sc.an} vs ${sc.hn}`;
+                if (st.state === 'in') {
+                    const clock = [ev.status && ev.status.displayClock, st.shortDetail].filter(Boolean).join(' · ');
+                    return `🔴 ${sc.line}  _(${clock || 'live'})_`;
+                }
+                return `✅ ${sc.line}  _(Final)_`;
+            });
+            const embed = new EmbedBuilder()
+                .setColor(0x6E33D6)
+                .setTitle('⚽ World Cup — Today\'s Matches')
+                .setDescription(lines.join('\n').slice(0, 4000))
+                .addFields({ name: 'Watch live (official)', value: `[FIFA+](${WC_WATCH_LINK}) — or your local rights-holder (US: FOX/Telemundo · UK: BBC/ITV)` })
+                .setFooter({ text: 'Kickoff times show in your local timezone · via ESPN' });
+            await interaction.editReply({ embeds: [embed] });
+        } catch (e) {
+            console.error('wcfixtures error:', e);
+            await interaction.editReply('Couldn\'t load the World Cup schedule right now. Please try again in a moment.');
+        }
+    }
+
+    if (commandName === 'teamstats') {
+        const norm = (interaction.channel?.name || '').toLowerCase().replace(/[^a-z]/g, '');
+        if (!norm.includes('worldcup')) {
+            return interaction.reply({ content: '⚽ The `/teamstats` command can be used in the #worldcup channel.', ephemeral: true });
+        }
+        await interaction.deferReply({ ephemeral: true });
+        try {
+            const events = await wcFixtures();
+            if (!events.length) {
+                return interaction.editReply('No World Cup matches are on the board today. Try `/wcfixtures` to see the schedule.');
+            }
+            const matchupLines = [];
+            const rows = [];
+            let current = new ActionRowBuilder();
+            let count = 0;
+            for (const ev of events) {
+                const comp = (ev.competitions && ev.competitions[0]) || {};
+                const sc = espnScoreLine(ev);
+                const st = (ev.status && ev.status.type) || {};
+                const epoch = Math.floor((Date.parse(ev.date) || 0) / 1000);
+                if (st.state === 'pre') matchupLines.push(`🕐 <t:${epoch}:t> — ${sc.an} vs ${sc.hn}`);
+                else if (st.state === 'in') matchupLines.push(`🔴 ${sc.line} _(live)_`);
+                else matchupLines.push(`✅ ${sc.line} _(Final)_`);
+                for (const c of (comp.competitors || [])) {
+                    if (count >= 25) break;
+                    const t = c.team || {};
+                    const label = (t.displayName || t.shortDisplayName || t.name || 'Team').slice(0, 80);
+                    current.addComponents(
+                        new ButtonBuilder()
+                            .setCustomId(`ts:${ev.id}:${t.id}`)
+                            .setLabel(label)
+                            .setStyle(st.state === 'in' ? ButtonStyle.Success : ButtonStyle.Secondary)
+                    );
+                    count++;
+                    if (current.components.length === 5) { rows.push(current); current = new ActionRowBuilder(); }
+                }
+                if (count >= 25) break;
+            }
+            if (current.components.length) rows.push(current);
+            await interaction.editReply({
+                content: `⚽ **Today's World Cup teams** — tap a team to see its players' **goals, assists & shots on target** so far this World Cup.\n\n${matchupLines.join('\n')}\n\n_Totals are there before kickoff and keep updating live during the game. (A team playing its first match won't have numbers yet.)_`,
+                components: rows.slice(0, 5)
+            });
+        } catch (e) {
+            console.error('teamstats command error:', e);
+            await interaction.editReply('Couldn\'t load today\'s teams right now. Please try again in a moment.');
+        }
+    }
+
+    if (commandName === 'updates') {
+        const norm = (interaction.channel?.name || '').toLowerCase().replace(/[^a-z]/g, '');
+        const isWorldcup = norm.includes('worldcup');
+        const isTools = norm.includes('tools');
+        if (!isWorldcup && !isTools) {
+            return interaction.reply({ content: '⚽ Use `/updates` in the #worldcup channel (soccer) or the #tools channel (all sports).', ephemeral: true });
+        }
+        await interaction.deferReply({ ephemeral: true });
+        try {
+            let pairs;
+            if (isWorldcup) {
+                pairs = (await wcFixtures() || []).map(ev => ({ lg: WC_LEAGUE, ev }));
+            } else {
+                pairs = await todaysGamesAllSports();
+            }
+            const open = pairs.filter(({ ev }) => {
+                const st = (ev.status && ev.status.type && ev.status.type.state) || '';
+                return st === 'pre' || st === 'in';
+            });
+            if (!open.length) {
+                return interaction.editReply(isWorldcup
+                    ? 'There are no upcoming or live World Cup matches today to follow. Check back when today\'s games are on, or use `/wcfixtures` to see the schedule.'
+                    : 'There are no games on today to follow right now. Check back when today\'s games are on.');
+            }
+            open.sort((a, b) => {
+                const ra = espnGameRank(a.ev), rb = espnGameRank(b.ev);     // 0 = live, 1 = upcoming
+                if (ra !== rb) return ra - rb;
+                return (Date.parse(a.ev.date) || 0) - (Date.parse(b.ev.date) || 0);
+            });
+            const options = open.slice(0, 25).map(({ lg, ev }) => {
+                const sc = espnScoreLine(ev);
+                const st = (ev.status && ev.status.type) || {};
+                const live = st.state === 'in';
+                const emo = SPORT_EMOJI[lg.sport] || '•';
+                const desc = isWorldcup
+                    ? (live ? `🔴 Live — ${st.shortDetail || 'in progress'}` : 'Starts later today')
+                    : `${emo} ${lg.name}${live ? ` · 🔴 ${st.shortDetail || 'live'}` : ''}`;
+                return {
+                    label: `${sc.an} vs ${sc.hn}`.slice(0, 100),
+                    description: desc.slice(0, 100),
+                    value: `${lg.key}:${ev.id}`
+                };
+            });
+            const menu = new StringSelectMenuBuilder()
+                .setCustomId('wcwatch')
+                .setPlaceholder(isWorldcup ? 'Pick the match(es) you want goal alerts for' : 'Pick the game(s) you want score alerts for')
+                .setMinValues(1)
+                .setMaxValues(options.length)
+                .addOptions(options);
+            const row = new ActionRowBuilder().addComponents(menu);
+            const blurb = isWorldcup
+                ? '⚽ **Get goal alerts** — choose one or more of today\'s matches below. The moment someone scores, I\'ll ping you right here with the scorer, the assist, and the new score. Pick as many matches as you like.'
+                : '📣 **Get score alerts** — choose one or more of today\'s games below and I\'ll ping you here when the score changes. (Soccer = full goal detail; basketball = end of each quarter + final, so your phone won\'t blow up.)';
+            await interaction.editReply({
+                content: blurb + (open.length > 25 ? '\n\n_Lots of games today — showing the first 25 (live games first)._' : ''),
+                components: [row]
+            });
+        } catch (e) {
+            console.error('updates command error:', e);
+            await interaction.editReply('Couldn\'t load today\'s games right now. Please try again in a moment.');
+        }
+    }
+
+    if (commandName === 'wcstandings') {
+        const norm = (interaction.channel?.name || '').toLowerCase().replace(/[^a-z]/g, '');
+        if (!norm.includes('worldcup')) {
+            return interaction.reply({ content: '⚽ The `/wcstandings` command can be used in the #worldcup channel.', ephemeral: true });
+        }
+        await interaction.deferReply({ ephemeral: true });
+        try {
+            const groups = await wcStandings();
+            if (!groups.length) return interaction.editReply('Group standings aren\'t available yet.');
+            const embed = new EmbedBuilder()
+                .setColor(0x6E33D6)
+                .setTitle('⚽ World Cup — Group Standings')
+                .setFooter({ text: 'Row: # Team  GP  W-D-L  GD  Pts · via ESPN' });
+            for (const g of groups) {
+                const entries = (g.standings && g.standings.entries) || [];
+                const rows = entries.map((en, i) => {
+                    const name = String((en.team && en.team.displayName) || '?').slice(0, 12).padEnd(12);
+                    const gp = wcStat(en.stats, 'gamesPlayed');
+                    const w = wcStat(en.stats, 'wins'), d = wcStat(en.stats, 'ties'), l = wcStat(en.stats, 'losses');
+                    const gd = wcStat(en.stats, 'pointDifferential');
+                    const pts = wcStat(en.stats, 'points');
+                    return `${i + 1} ${name} ${gp}  ${w}-${d}-${l}  ${gd.padStart(3)}  ${pts}p`;
+                });
+                embed.addFields({ name: g.name || 'Group', value: '```\n' + (rows.join('\n') || '—') + '\n```' });
+            }
+            await interaction.editReply({ embeds: [embed] });
+        } catch (e) {
+            console.error('wcstandings error:', e);
+            await interaction.editReply('Couldn\'t load the group standings right now. Please try again in a moment.');
+        }
+    }
+
+    if (commandName === 'wcrecap') {
+        const norm = (interaction.channel?.name || '').toLowerCase().replace(/[^a-z]/g, '');
+        if (!norm.includes('worldcup')) {
+            return interaction.reply({ content: '⚽ The `/wcrecap` command can be used in the #worldcup channel.', ephemeral: true });
+        }
+        const team = options.getString('team');
+        await interaction.deferReply({ ephemeral: true });
+        try {
+            const game = await wcFindRecentGame(team);
+            if (!game) {
+                return interaction.editReply(`I couldn't find a World Cup match for **${team}**. Try the country name — e.g. \`Brazil\`, \`Morocco\`.`);
+            }
+            const summary = await espnSummary(game.lg, game.ev.id);
+            const sc = espnScoreLine(game.ev);
+            const st = (game.ev.status && game.ev.status.type) || {};
+            const epoch = Math.floor((Date.parse(game.ev.date) || 0) / 1000);
             const head = st.state === 'pre' ? `🗓️ Kicks off <t:${epoch}:F>`
                 : st.state === 'in' ? `🔴 LIVE — ${sc.line}`
                 : `✅ Final — ${sc.line}`;
@@ -2221,50 +2466,23 @@ client.on('interactionCreate', async interaction => {
         if (!norm.includes('watchprop')) {
             return interaction.reply({ content: '👀 The `/watchprop` command can only be used in the #watchprop channel.', ephemeral: true });
         }
-        const player = options.getString('player');
-        const statKey = options.getString('stat');
-        const target = options.getInteger('target');
-        const leagueKey = options.getString('league') || null;
-        // Always private — only the member who set the watch sees this confirmation.
         await interaction.deferReply({ ephemeral: true });
         try {
-            const def = WATCH_STATS[statKey];
-            if (!def) return interaction.editReply('Please pick a stat from the list.');
-            const game = await findPlayerWatchGame(player, leagueKey, statKey);
-            if (!game) {
-                return interaction.editReply(
-                    `I couldn't find **${player}** in a live game right now.\n` +
-                    `• I can only start a watch once the game is **live** — that's when player stats show up.\n` +
-                    `• Live player tracking works for basketball (NBA, WNBA, college), baseball (MLB), and hockey (NHL).\n` +
-                    `• Try again once the game has started, and pick the **league** to help me find it faster.`
-                );
+            const sports = await sportsPlayingToday();
+            if (!sports.length) {
+                return interaction.editReply('No games today in the sports I can track yet (basketball, baseball, hockey, soccer). Check back closer to game time!');
             }
-            const word = def.word;
-            const dup = await dbQuery(
-                `SELECT id FROM bot_watches WHERE user_id=$1 AND event_id=$2 AND lower(player_name)=lower($3) AND stat_key=$4 AND status='active'`,
-                [interaction.user.id, game.ev.id, game.player, statKey]
-            );
-            if (dup.rows.length) {
-                await dbQuery(`UPDATE bot_watches SET target_value=$1, updated_at=NOW() WHERE id=$2`, [target, dup.rows[0].id]);
-                return interaction.editReply(
-                    `✅ Updated your watch on **${game.player}** to **${target}+ ${word}** in **${game.ev.name}**.\n` +
-                    `They're at **${game.value} ${word}** right now. I'll keep DMing you as it moves.`
-                );
-            }
-            await dbQuery(
-                `INSERT INTO bot_watches (user_id, league_key, event_id, event_name, player_name, stat_key, target_value, last_value, last_notified_value, status)
-                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$8,'active')
-                 ON CONFLICT (user_id, event_id, player_name, stat_key) WHERE status = 'active'
-                 DO UPDATE SET target_value = EXCLUDED.target_value, updated_at = NOW()`,
-                [interaction.user.id, game.lg.key, game.ev.id, game.ev.name, game.player, statKey, target, game.value]
-            );
-            await interaction.editReply(
-                `✅ Watching **${game.player}** for **${target}+ ${word}** in **${game.ev.name}** (${game.lg.name}).\n` +
-                `They're at **${game.value} ${word}** right now. I'll DM you as it climbs — make sure your DMs are open!`
-            );
+            const rows = [];
+            let row = new ActionRowBuilder();
+            sports.forEach((s, i) => {
+                if (i > 0 && i % 5 === 0) { rows.push(row); row = new ActionRowBuilder(); }
+                row.addComponents(new ButtonBuilder().setCustomId(`wp:sport:${s.sport}`).setLabel(s.label).setStyle(ButtonStyle.Primary));
+            });
+            rows.push(row);
+            await interaction.editReply({ content: '🎯 **Set a player-prop watch**\nPick a sport being played today, then type a player and choose a stat:', components: rows });
         } catch (e) {
             console.error('watchprop command error:', e);
-            await interaction.editReply('Something went wrong setting up that watch. Please try again in a moment.');
+            await interaction.editReply('Something went wrong loading today\'s games. Please try again in a moment.');
         }
     }
 });
@@ -2610,7 +2828,7 @@ app.get('/oauth/callback', async (req, res) => {
     }
 });
 
-const BUILD_MARKER = 'updates-eastern-time-2026-06-16-18';
+const BUILD_MARKER = 'memberschat-stats-only-plus-updates-stopall-2026-06-18';
 app.get('/', (_req, res) => {
     let betSlips = 'unknown';
     try {
