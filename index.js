@@ -95,6 +95,12 @@ async function initDb() {
         ALTER TABLE bot_goal_watches ADD COLUMN IF NOT EXISTS last_home INTEGER;
         ALTER TABLE bot_goal_watches ADD COLUMN IF NOT EXISTS last_away INTEGER;
         ALTER TABLE bot_goal_watches ADD COLUMN IF NOT EXISTS last_period INTEGER;
+        CREATE TABLE IF NOT EXISTS bot_promos (
+            id SERIAL PRIMARY KEY,
+            book TEXT NOT NULL,
+            deal TEXT NOT NULL,
+            created_at TIMESTAMPTZ DEFAULT NOW()
+        );
     `);
     console.log('Database tables ready.');
 }
@@ -148,6 +154,22 @@ async function dbGetPending(usernameKey) {
 }
 async function dbDeletePending(usernameKey) {
     await dbQuery(`DELETE FROM bot_pending WHERE username_key = $1`, [usernameKey]);
+}
+async function dbAddPromo(book, deal) {
+    const r = await dbQuery(`INSERT INTO bot_promos (book, deal) VALUES ($1, $2) RETURNING id`, [book, deal]);
+    return r.rows[0]?.id;
+}
+async function dbGetPromos() {
+    const r = await dbQuery(`SELECT id, book, deal FROM bot_promos ORDER BY book ASC, id ASC`);
+    return r.rows;
+}
+async function dbRemovePromo(id) {
+    const r = await dbQuery(`DELETE FROM bot_promos WHERE id = $1`, [id]);
+    return r.rowCount;
+}
+async function dbClearPromos() {
+    const r = await dbQuery(`DELETE FROM bot_promos`);
+    return r.rowCount;
 }
 
 const client = new Client({
@@ -1735,6 +1757,15 @@ client.once('ready', async () => {
             { name: 'league', type: 3, description: 'Optional: pick the league to search faster', required: false, choices: espnLeagueChoices }
         ] },
         { name: 'watchprop', description: 'Watch a player\'s stat & get DMs as it climbs — pick a sport to start' },
+        { name: 'promos', description: 'See today\'s sportsbook promos & boosts (#tools)' },
+        { name: 'addpromo', description: 'Admin: post a sportsbook promo', options: [
+            { name: 'book', type: 3, description: 'Sportsbook — e.g. FanDuel, DraftKings', required: true },
+            { name: 'deal', type: 3, description: 'The promo — e.g. 50% profit boost on soccer', required: true }
+        ], defaultMemberPermissions: ADMIN_ONLY },
+        { name: 'removepromo', description: 'Admin: remove one promo by its number', options: [
+            { name: 'number', type: 4, description: 'The number shown beside the promo in /promos', required: true }
+        ], defaultMemberPermissions: ADMIN_ONLY },
+        { name: 'clearpromos', description: 'Admin: remove all promos', defaultMemberPermissions: ADMIN_ONLY },
         // ===== WORLD CUP 2026 — TEMPORARY commands (remove these 3 after the tournament) =====
         { name: 'wcfixtures', description: 'World Cup: today\'s matches + kickoff times' },
         { name: 'wcstandings', description: 'World Cup: group-stage tables' },
@@ -1773,6 +1804,24 @@ client.on('messageCreate', async message => {
     if (message.author.bot || !message.guild) return;
     // Match the bet-slips channel even if it has an emoji/separator in the name
     const cname = (message.channel.name || '').toLowerCase().replace(/[^a-z]/g, '');
+
+    // #worldcup is a commands-only channel: a member's typed message is removed so the channel
+    // stays clean — only the bot's goal alerts and each member's own private command replies show.
+    if (cname.includes('worldcup')) {
+        const isStaff = message.member?.permissions?.has(PermissionFlagsBits.ManageMessages)
+            || message.member?.permissions?.has(PermissionFlagsBits.Administrator);
+        if (!isStaff) {
+            try {
+                await message.delete();
+                const warn = await message.channel.send(`<@${message.author.id}> this channel is for the World Cup commands only — type **/** to use them. Your message was removed to keep it clean. ⚽`);
+                setTimeout(() => warn.delete().catch(() => {}), 7000);
+            } catch (e) {
+                console.error('worldcup delete failed (needs Manage Messages permission?):', e.message);
+            }
+        }
+        return;
+    }
+
     if (!cname.includes('betslips')) return;
 
     const hasAttachment = message.attachments.size > 0;
@@ -2103,11 +2152,11 @@ client.on('interactionCreate', async interaction => {
         }
     }
 
-    // ===== /livescore — live score for any game, #tools only =====
+    // ===== /livescore — live score for any game, #tools and #worldcup =====
     if (commandName === 'livescore') {
         const norm = (interaction.channel?.name || '').toLowerCase().replace(/[^a-z]/g, '');
-        if (!norm.includes('tools')) {
-            return interaction.reply({ content: '📺 The `/livescore` command can only be used in the #tools channel.', ephemeral: true });
+        if (!norm.includes('tools') && !norm.includes('worldcup')) {
+            return interaction.reply({ content: '📺 The `/livescore` command can be used in the #tools or #worldcup channel.', ephemeral: true });
         }
         const team = options.getString('team');
         const leagueKey = options.getString('league') || null;
@@ -2232,6 +2281,75 @@ client.on('interactionCreate', async interaction => {
         } catch (e) {
             console.error('news command error:', e);
             await interaction.editReply('Couldn\'t load news right now. Please try again in a moment.');
+        }
+    }
+
+    // ===== /promos — sportsbook promos & boosts, #tools (admins manage with /addpromo) =====
+    if (commandName === 'promos') {
+        const norm = (interaction.channel?.name || '').toLowerCase().replace(/[^a-z]/g, '');
+        if (!norm.includes('tools')) {
+            return interaction.reply({ content: '🎁 The `/promos` command can only be used in the #tools channel.', ephemeral: true });
+        }
+        await interaction.deferReply({ ephemeral: true });
+        try {
+            const rows = await dbGetPromos();
+            if (!rows.length) {
+                return interaction.editReply('🎁 No promos are posted right now. Check back soon!');
+            }
+            const isAdmin = interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild);
+            const lines = rows.map(p => `• **${p.book}** — ${p.deal}${isAdmin ? `  _(#${p.id})_` : ''}`);
+            const embed = new EmbedBuilder()
+                .setColor(0xFFD700)
+                .setTitle('🎁 Sportsbook Promos & Boosts')
+                .setDescription(lines.join('\n').slice(0, 4000))
+                .setFooter({ text: 'Promos change fast — always check the app for exact terms.' });
+            await interaction.editReply({ embeds: [embed] });
+        } catch (e) {
+            console.error('promos command error:', e);
+            await interaction.editReply('Something went wrong loading promos. Please try again in a moment.');
+        }
+    }
+
+    // ===== /addpromo, /removepromo, /clearpromos — admin promo management =====
+    if (commandName === 'addpromo') {
+        if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
+            return interaction.reply({ content: '🔒 Only admins can add promos.', ephemeral: true });
+        }
+        const book = (options.getString('book') || '').slice(0, 80);
+        const deal = (options.getString('deal') || '').slice(0, 300);
+        try {
+            const id = await dbAddPromo(book, deal);
+            await interaction.reply({ content: `✅ Added promo **#${id}** — **${book}**: ${deal}\nMembers can see it with \`/promos\` in #tools.`, ephemeral: true });
+        } catch (e) {
+            console.error('addpromo error:', e);
+            await interaction.reply({ content: 'Couldn\'t add that promo just now — please try again.', ephemeral: true });
+        }
+    }
+
+    if (commandName === 'removepromo') {
+        if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
+            return interaction.reply({ content: '🔒 Only admins can remove promos.', ephemeral: true });
+        }
+        const id = options.getInteger('number');
+        try {
+            const n = await dbRemovePromo(id);
+            await interaction.reply({ content: n ? `🗑️ Removed promo **#${id}**.` : `I couldn't find a promo numbered **#${id}**. Run \`/promos\` to see the current numbers.`, ephemeral: true });
+        } catch (e) {
+            console.error('removepromo error:', e);
+            await interaction.reply({ content: 'Couldn\'t remove that promo just now — please try again.', ephemeral: true });
+        }
+    }
+
+    if (commandName === 'clearpromos') {
+        if (!interaction.memberPermissions?.has(PermissionFlagsBits.ManageGuild)) {
+            return interaction.reply({ content: '🔒 Only admins can clear promos.', ephemeral: true });
+        }
+        try {
+            const n = await dbClearPromos();
+            await interaction.reply({ content: `🧹 Cleared **${n}** promo${n === 1 ? '' : 's'}.`, ephemeral: true });
+        } catch (e) {
+            console.error('clearpromos error:', e);
+            await interaction.reply({ content: 'Couldn\'t clear promos just now — please try again.', ephemeral: true });
         }
     }
 
@@ -2828,7 +2946,7 @@ app.get('/oauth/callback', async (req, res) => {
     }
 });
 
-const BUILD_MARKER = 'memberschat-stats-only-plus-updates-stopall-2026-06-18';
+const BUILD_MARKER = 'worldcup-lockdown-livescore-promos-2026-06-21';
 app.get('/', (_req, res) => {
     let betSlips = 'unknown';
     try {
