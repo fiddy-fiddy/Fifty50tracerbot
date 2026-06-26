@@ -2946,7 +2946,7 @@ app.get('/oauth/callback', async (req, res) => {
     }
 });
 
-const BUILD_MARKER = 'worldcup-lockdown-livescore-promos-2026-06-21';
+const BUILD_MARKER = 'worldcup-promos-loginfix-2026-06-26';
 app.get('/', (_req, res) => {
     let betSlips = 'unknown';
     try {
@@ -2973,4 +2973,5 @@ const PORT = process.env.PORT || 8080;
 app.listen(PORT, '0.0.0.0', () => console.log(`Webhook server listening on port ${PORT}`));
 
 // ====== LOGIN ======
-client.login(process.env.DISCORD_BOT_TOKEN);
+if (!process.env.DISCORD_BOT_TOKEN) console.error('FATAL: DISCORD_BOT_TOKEN is missing in Railway Variables — the bot cannot log in.');
+client.login(process.env.DISCORD_BOT_TOKEN).then(() => console.log('Discord login() accepted — connecting to gateway…')).catch(err => console.error('FATAL: Discord login failed —', err && err.message ? err.message : err));
