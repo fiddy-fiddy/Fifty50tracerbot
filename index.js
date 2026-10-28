@@ -836,10 +836,31 @@ if (lg.key === 'mlb') return mlbWatchSchedule(now);
 if (lg.key === 'nhl') return nhlWatchSchedule(now);
 if (lg.key === 'wnba') return wnbaWatchSchedule(now);
 if (!leaguesForSport(lg.sport).some(l => l.key === lg.key)) throw new Error('Unsupported watch league');
-const dates = `${watchDateKey(new Date(now.getTime() - 86400000))}-${watchDateKey(now)}`;
-const data = await espnGet(`${ESPN_BASE}/${lg.sport}/${lg.league}/scoreboard?dates=${dates}&limit=1000${lg.key === 'ncaab' ? '&groups=50' : ''}`, 25000);
+// NBA rejects date ranges. Query days independently so yesterday's failure
+// cannot prevent members from selecting players in today's games.
+const today = watchDateKey(now);
+const days = [today, watchDateKey(new Date(now.getTime() - 86400000))];
+const results = await Promise.allSettled(days.map(async day => {
+const data = await espnGet(`${ESPN_BASE}/${lg.sport}/${lg.league}/scoreboard?dates=${day}&limit=1000${lg.key === 'ncaab' ? '&groups=50' : ''}`, 25000);
 if (!Array.isArray(data.events)) throw new Error('ESPN schedule data missing');
 return data.events;
+}));
+const usable = new Map();
+const failures = results.filter(r => r.status === 'rejected');
+if (failures.length === results.length) throw failures[0].reason;
+for (const result of results) {
+if (result.status !== 'fulfilled') continue;
+for (const event of result.value) {
+const state = event.status?.type?.state;
+const date = new Date(event.date);
+if (state === 'in' || (state === 'pre' && Number.isFinite(date.getTime()) && watchDateKey(date) === today)) {
+usable.set(String(event.id), event);
+}
+}
+}
+const events = [...usable.values()];
+events.partial = failures.length > 0;
+return events;
 }
 
 // score a team query against an ESPN event (city/nickname/abbr all live in the team object)
@@ -1207,10 +1228,11 @@ if (userId && s.userId !== userId) return null;
 return s;
 }
 
-// DM a user by id, swallowing errors (closed DMs etc.) so the poller never crashes
+// Let the per-watch error handler retain unsent alerts for a later poll.
+// Swallowing a send failure would incorrectly advance last_notified_value.
 async function dmUser(userId, content) {
-try { const u = await client.users.fetch(userId); await u.send(content); }
-catch (e) { console.error(`watch DM to ${userId} failed:`, e.message); }
+const u = await client.users.fetch(userId);
+await u.send(content);
 }
 
 // ---- watch poller: checks each active watch's game and DMs the owner as the stat moves ----
@@ -3209,7 +3231,7 @@ res.status(500).send(htmlPage('Error', `<h1 class="error">Something went wrong</
 }
 });
 
-const BUILD_MARKER = 'watchprop-all-sports-header-fix-2026-10-28';
+const BUILD_MARKER = 'watchprop-all-sports-verified-2026-10-28';
 app.get('/', (_req, res) => {
 let betSlips = 'unknown';
 try {
