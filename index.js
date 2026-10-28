@@ -630,7 +630,8 @@ const espnCache = new Map(); // url -> { at, data }
 async function espnGet(url, ttlMs) {
 const hit = espnCache.get(url);
 if (hit && Date.now() - hit.at < ttlMs) return hit.data;
-const resp = await fetchWithTimeout(url, { headers: { 'User-Agent': 'Mozilla/5.0 (compatible; FiddyBot/1.0)' } }, 12000);
+// Use Node's normal request identity: the former custom bot header caused 403s.
+const resp = await fetchWithTimeout(url, {}, 12000);
 if (!resp.ok) throw new Error(`ESPN HTTP ${resp.status}`);
 const data = await resp.json();
 espnCache.set(url, { at: Date.now(), data });
@@ -644,6 +645,183 @@ async function espnSummary(lg, eventId) {
 return espnGet(`${ESPN_BASE}/${lg.sport}/${lg.league}/summary?event=${eventId}`, 35000);
 }
 
+// Prefix MLB IDs so existing ESPN watches cannot be confused with MLB's IDs.
+async function mlbGet(path, ttl = 25000) {
+const url = 'https://statsapi.mlb.com' + path;
+const hit = espnCache.get(url);
+if (hit && Date.now() - hit.at < ttl) return hit.data;
+const response = await fetchWithTimeout(url, { headers: { Accept: 'application/json' } }, 12000);
+if (!response.ok) throw new Error(`MLB HTTP ${response.status}`);
+const data = await response.json();
+espnCache.set(url, { at: Date.now(), data });
+return data;
+}
+function mlbState(status) {
+return ({ Preview: 'pre', Live: 'in', Final: 'post' })[status?.abstractGameState] || null;
+}
+async function mlbWatchSchedule(now = new Date()) {
+const date = key => `${key.slice(0, 4)}-${key.slice(4, 6)}-${key.slice(6, 8)}`;
+const today = date(watchDateKey(now));
+const yesterday = date(watchDateKey(new Date(now.getTime() - 86400000)));
+const data = await mlbGet(`/api/v1/schedule?sportId=1&startDate=${yesterday}&endDate=${today}`);
+if (!Array.isArray(data.dates)) throw new Error('Invalid MLB schedule');
+return data.dates.flatMap(d => d.games || []).filter(g =>
+mlbState(g.status) === 'in' || (mlbState(g.status) === 'pre' && g.officialDate === today)
+).map(g => ({
+id: `mlb:${g.gamePk}`, date: g.gameDate,
+name: `${g.teams.away.team.name} at ${g.teams.home.team.name}`,
+status: { type: { state: mlbState(g.status) } },
+competitions: [{ competitors: ['away', 'home'].map(side => ({
+team: { id: g.teams[side].team.id, displayName: g.teams[side].team.name }
+})) }]
+}));
+}
+async function mlbWatchRoster(teamId) {
+const data = await mlbGet(`/api/v1/teams/${teamId}/roster?rosterType=active`, 300000);
+if (!Array.isArray(data.roster)) throw new Error('Invalid MLB roster');
+return data.roster.filter(p => p.person?.id && p.person?.fullName)
+.map(p => ({ id: String(p.person.id), name: p.person.fullName }));
+}
+function normalizeMlbWatchSummary(data) {
+const teams = data.liveData?.boxscore?.teams;
+if (!teams || !data.gameData?.status) throw new Error('MLB box score unavailable');
+const players = ['away', 'home'].map(side => {
+const team = teams[side];
+const entries = Object.values(team?.players || {});
+return {
+team: { displayName: team?.team?.name },
+statistics: [
+{ name: 'batting', keys: ['homeRuns', 'hits', 'RBIs', 'runs'],
+athletes: entries.filter(p => p.stats?.batting && Object.keys(p.stats.batting).length).map(p => ({
+athlete: { id: String(p.person.id), displayName: p.person.fullName },
+stats: ['homeRuns', 'hits', 'rbi', 'runs'].map(k => p.stats.batting[k] ?? null)
+})) },
+{ name: 'pitching', keys: ['strikeouts'],
+athletes: entries.filter(p => p.stats?.pitching && Object.keys(p.stats.pitching).length).map(p => ({
+athlete: { id: String(p.person.id), displayName: p.person.fullName },
+stats: [p.stats.pitching.strikeOuts ?? null]
+})) }
+]
+};
+});
+return { header: { competitions: [{ status: { type: { state: mlbState(data.gameData.status) } } }] },
+boxscore: { players } };
+}
+async function watchSummary(lg, eventId) {
+if (lg.key === 'mlb' && String(eventId).startsWith('mlb:')) {
+const id = String(eventId).slice(4);
+if (!/^\d+$/.test(id)) throw new Error('Invalid MLB game identifier');
+return normalizeMlbWatchSummary(await mlbGet(`/api/v1.1/game/${id}/feed/live`));
+}
+if (lg.key === 'nhl' && /^nhl:\d+$/.test(String(eventId))) {
+return normalizeNhlSummary(await watchFeedGet(`https://api-web.nhle.com/v1/gamecenter/${String(eventId).slice(4)}/boxscore`));
+}
+if (lg.key === 'wnba' && /^wnba:\d+$/.test(String(eventId))) {
+return normalizeWnbaSummary(await wnbaBoxscore(String(eventId).slice(5)));
+}
+if (leaguesForSport(lg.sport).some(l => l.key === lg.key) && /^\d+$/.test(String(eventId))) {
+return espnSummary(lg, eventId);
+}
+throw new Error('Unsupported watch source or invalid game identifier');
+}
+
+async function watchFeedGet(url, ttl = 25000) {
+const hit = espnCache.get(url);
+if (hit && Date.now() - hit.at < ttl) return hit.data;
+const response = await fetchWithTimeout(url, { headers: { Accept: 'application/json' } }, 12000);
+if (!response.ok) throw new Error(`Live feed HTTP ${response.status} (${new URL(url).hostname})`);
+const data = await response.json();
+espnCache.set(url, { at: Date.now(), data });
+return data;
+}
+const nhlState = state => ['LIVE', 'CRIT'].includes(state) ? 'in'
+: ['FINAL', 'OFF'].includes(state) ? 'post' : ['FUT', 'PRE'].includes(state) ? 'pre' : null;
+function feedSummary(state, players) {
+return { header: { competitions: [{ status: { type: { state } } }] }, boxscore: { players } };
+}
+async function nhlWatchSchedule(now) {
+const date = key => `${key.slice(0, 4)}-${key.slice(4, 6)}-${key.slice(6)}`;
+const today = watchDateKey(now);
+const days = await Promise.allSettled([today, watchDateKey(new Date(now.getTime() - 86400000))]
+.map(day => watchFeedGet(`https://api-web.nhle.com/v1/score/${date(day)}`)));
+const good = days.filter(d => d.status === 'fulfilled' && Array.isArray(d.value.games));
+if (!good.length) throw new Error('NHL schedule unavailable');
+const games = [...new Map(good.flatMap(d => d.value.games).map(g => [g.id, g])).values()];
+const events = games.filter(g => nhlState(g.gameState) === 'in' ||
+(nhlState(g.gameState) === 'pre' && watchDateKey(new Date(g.startTimeUTC)) === today))
+.map(g => ({
+id: `nhl:${g.id}`, date: g.startTimeUTC,
+name: `${g.awayTeam.abbrev} at ${g.homeTeam.abbrev}`,
+status: { type: { state: nhlState(g.gameState) } },
+competitions: [{ competitors: ['awayTeam', 'homeTeam'].map(side => ({
+team: { id: g[side].abbrev, displayName: g[side].name?.default || g[side].abbrev }
+})) }]
+}));
+events.partial = good.length !== days.length;
+return events;
+}
+async function nhlWatchRoster(abbrev) {
+if (!/^[A-Z]{2,3}$/.test(abbrev)) throw new Error('Invalid NHL team');
+const data = await watchFeedGet(`https://api-web.nhle.com/v1/roster/${abbrev}/current`, 300000);
+if (!Array.isArray(data.forwards)) throw new Error('NHL roster unavailable');
+return ['forwards', 'defensemen', 'goalies'].flatMap(k => data[k] || []).map(p => ({
+id: String(p.id), name: `${p.firstName.default} ${p.lastName.default}`
+}));
+}
+function normalizeNhlSummary(data) {
+if (!data.playerByGameStats) throw new Error('NHL player stats not available yet');
+return feedSummary(nhlState(data.gameState), ['awayTeam', 'homeTeam'].map(side => ({
+team: { displayName: data[side]?.abbrev },
+statistics: ['forwards', 'defense', 'goalies'].map(group => ({
+name: group, keys: ['goals', 'assists', 'shotsTotal', 'hits', 'saves'],
+athletes: (data.playerByGameStats[side]?.[group] || []).map(p => ({
+athlete: { id: String(p.playerId), displayName: p.name.default },
+stats: ['goals', 'assists', 'sog', 'hits', 'saves'].map(key => p[key] ?? null)
+}))
+}))
+})));
+}
+const wnbaState = code => ({ 1: 'pre', 2: 'in', 3: 'post' })[code] || null;
+async function wnbaWatchSchedule(now) {
+const data = await watchFeedGet('https://cdn.wnba.com/static/json/staticData/scheduleLeagueV2.json', 60000);
+if (!Array.isArray(data.leagueSchedule?.gameDates)) throw new Error('WNBA schedule unavailable');
+const today = watchDateKey(now);
+return data.leagueSchedule.gameDates.flatMap(d => d.games || []).filter(g =>
+g.gameStatus === 2 || (g.gameStatus === 1 && g.postponedStatus !== 'Y' &&
+watchDateKey(new Date(g.gameDateTimeUTC)) === today)
+).map(g => ({
+id: `wnba:${g.gameId}`, date: g.gameDateTimeUTC,
+name: `${g.awayTeam.teamName} at ${g.homeTeam.teamName}`,
+status: { type: { state: wnbaState(g.gameStatus) } },
+competitions: [{ competitors: ['awayTeam', 'homeTeam'].map(side => ({
+team: { id: String(g[side].teamId), displayName: `${g[side].teamCity} ${g[side].teamName}` }
+})) }]
+}));
+}
+async function wnbaBoxscore(id) {
+if (!/^\d+$/.test(id)) throw new Error('Invalid WNBA game');
+const data = await watchFeedGet(`https://cdn.wnba.com/static/json/liveData/boxscore/boxscore_${id}.json`);
+if (!data.game?.homeTeam || !data.game?.awayTeam) throw new Error('WNBA player data not available yet');
+return data.game;
+}
+async function wnbaWatchRoster(teamId, eventId) {
+const game = await wnbaBoxscore(String(eventId).replace(/^wnba:/, ''));
+const team = [game.homeTeam, game.awayTeam].find(t => String(t.teamId) === String(teamId));
+if (!team?.players?.length) throw new Error('WNBA game roster not published yet; try closer to tipoff');
+return team.players.map(p => ({ id: String(p.personId), name: p.name }));
+}
+function normalizeWnbaSummary(game) {
+const keys = ['points', 'reboundsTotal', 'assists', 'threePointersMade', 'steals', 'blocks'];
+return feedSummary(wnbaState(game.gameStatus), ['awayTeam', 'homeTeam'].map(side => ({
+team: { displayName: game[side].teamName },
+statistics: [{ labels: ['PTS', 'REB', 'AST', '3PT', 'STL', 'BLK'],
+athletes: (game[side].players || []).map(p => ({
+athlete: { id: String(p.personId), displayName: p.name },
+stats: keys.map(key => p.statistics?.[key] ?? null)
+})) }]
+})));
+}
+
 // Watch setup uses an explicit Eastern calendar day, not ESPN's default slate
 // (football defaults to a whole week). Include yesterday only for games still live.
 function watchDateKey(now = new Date()) {
@@ -654,18 +832,14 @@ timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit'
 .map(p => p.value).join('');
 }
 async function watchScoreboard(lg, now = new Date()) {
-const today = watchDateKey(now);
-const yesterday = watchDateKey(new Date(now.getTime() - 24 * 60 * 60 * 1000));
-// MLB does not consistently accept date ranges; request each calendar day separately.
-const slates = await Promise.all([yesterday, today].map(async date => {
-const data = await espnGet(`${ESPN_BASE}/${lg.sport}/${lg.league}/scoreboard?dates=${date}`, 25000);
-if (!Array.isArray(data?.events)) throw new Error(`Invalid ESPN schedule for ${lg.key}`);
+if (lg.key === 'mlb') return mlbWatchSchedule(now);
+if (lg.key === 'nhl') return nhlWatchSchedule(now);
+if (lg.key === 'wnba') return wnbaWatchSchedule(now);
+if (!leaguesForSport(lg.sport).some(l => l.key === lg.key)) throw new Error('Unsupported watch league');
+const dates = `${watchDateKey(new Date(now.getTime() - 86400000))}-${watchDateKey(now)}`;
+const data = await espnGet(`${ESPN_BASE}/${lg.sport}/${lg.league}/scoreboard?dates=${dates}&limit=1000${lg.key === 'ncaab' ? '&groups=50' : ''}`, 25000);
+if (!Array.isArray(data.events)) throw new Error('ESPN schedule data missing');
 return data.events;
-}));
-return [...new Map(slates.flat().map(ev => [String(ev.id), ev])).values()].filter(ev => {
-const state = ev.status?.type?.state;
-return state === 'in' || (state === 'pre' && ev.date && watchDateKey(new Date(ev.date)) === today);
-});
 }
 
 // score a team query against an ESPN event (city/nickname/abbr all live in the team object)
@@ -845,8 +1019,10 @@ const name = p.athlete && p.athlete.displayName;
 const pid = p.athlete && p.athlete.id;
 const sc = (athleteId && pid && String(pid) === String(athleteId)) ? 100 : playerMatchScore(playerQuery, name);
 if (sc <= 0) continue;
-const val = wcPlayerStat(p, def.rosterStat);
-const cand = { value: val == null ? 0 : val, player: name, team: teamName, score: sc };
+const cell = (p.stats || []).find(s => s.name === def.rosterStat);
+const val = parseStatNumber(cell?.value ?? cell?.displayValue);
+if (val == null) continue;
+const cand = { value: val, player: name, team: teamName, score: sc };
 if (!best || cand.score > best.score) best = cand;
 }
 }
@@ -875,7 +1051,8 @@ const pid = a.athlete && a.athlete.id;
 const sc = (athleteId && pid && String(pid) === String(athleteId)) ? 100 : playerMatchScore(playerQuery, name);
 if (sc <= 0) continue;
 const val = parseStatNumber((a.stats || [])[idx], def.madeAtt);
-const cand = { value: val == null ? 0 : val, player: name, team: teamName, score: sc };
+if (val == null) continue; // Missing data is not a verified zero.
+const cand = { value: val, player: name, team: teamName, score: sc };
 if (!best || cand.score > best.score) best = cand;
 }
 }
@@ -893,11 +1070,11 @@ return (comp && comp.status && comp.status.type && comp.status.type.state) || nu
 
 // supported sports + the prop menus shown for each (values are unique WATCH_STATS keys)
 const WATCH_SPORTS = [
-{ sport: 'football', label: '🏈 NFL' },
-{ sport: 'basketball', label: '🏀 Basketball' },
-{ sport: 'baseball', label: '⚾ Baseball' },
-{ sport: 'hockey', label: '🏒 Hockey' },
-{ sport: 'soccer', label: '⚽ Soccer' }
+{ sport: 'football', label: 'NFL' },
+{ sport: 'basketball', label: 'NBA / WNBA / College' },
+{ sport: 'baseball', label: '⚾ MLB' },
+{ sport: 'hockey', label: '🏒 NHL' },
+{ sport: 'soccer', label: 'Soccer' }
 ];
 const WATCH_PROPS = {
 football: [
@@ -937,23 +1114,21 @@ soccer: [
 { key: 'soccer_sot', label: 'Shots on Target' }
 ]
 };
-const leaguesForSport = sport => ESPN_LEAGUES.filter(l => l.sport === sport && (sport !== 'football' || l.key === 'nfl'));
+const leaguesForSport = sport => ESPN_LEAGUES.filter(l => l.sport === sport &&
+['mlb', 'nhl', 'wnba', 'nba', 'nfl', 'ncaab', 'epl', 'ucl', 'mls', 'wc'].includes(l.key));
 
 // a team's roster (athletes w/ id + name). ESPN returns athletes either flat or grouped (athletes[].items).
 // works for every sport BEFORE the game starts, so we can resolve a player pre-kickoff. cached 6h.
-async function teamRoster(lg, teamId) {
-const data = await espnGet(`${ESPN_BASE}/${lg.sport}/${lg.league}/teams/${teamId}/roster`, 6 * 60 * 60 * 1000);
-const groups = (data && data.athletes) || [];
-const flat = (Array.isArray(groups) && groups[0] && groups[0].items)
-? groups.flatMap(g => g.items || [])
-: groups;
-const out = [];
-for (const a of (flat || [])) {
-const id = a && a.id;
-const name = a && (a.displayName || a.fullName);
-if (id && name) out.push({ id: String(id), name });
-}
-return out;
+async function teamRoster(lg, teamId, eventId) {
+if (lg.key === 'mlb') return mlbWatchRoster(teamId);
+if (lg.key === 'nhl') return nhlWatchRoster(teamId);
+if (lg.key === 'wnba') return wnbaWatchRoster(teamId, eventId);
+if (!leaguesForSport(lg.sport).some(l => l.key === lg.key)) throw new Error('Unsupported watch league');
+const data = await espnGet(`${ESPN_BASE}/${lg.sport}/${lg.league}/teams/${encodeURIComponent(teamId)}/roster`, 6 * 60 * 60 * 1000);
+if (!Array.isArray(data.athletes)) throw new Error('ESPN roster data missing');
+return data.athletes.flatMap(a => a.items || [a])
+.filter(a => a.id && (a.displayName || a.fullName))
+.map(a => ({ id: String(a.id), name: a.displayName || a.fullName }));
 }
 
 // every athlete on a team playing today in this sport -> one candidate per athlete
@@ -967,6 +1142,7 @@ console.error(`watchprop schedule ${lg.key}:`, e.message);
 scheduleFailures++;
 continue;
 }
+if (events.partial) scheduleFailures++;
 for (const ev of events) {
 const state = ev.status && ev.status.type && ev.status.type.state;
 if (!['pre', 'in'].includes(state)) continue;
@@ -981,7 +1157,7 @@ if (t && t.id) games.push({ lg, evId: String(ev.id), eventName, state, teamId: S
 }
 }
 const fetched = await Promise.all(games.map(async g => {
-try { return { g, players: await teamRoster(g.lg, g.teamId) }; }
+try { return { g, players: await teamRoster(g.lg, g.teamId, g.evId) }; }
 catch (e) {
 console.error(`watchprop roster ${g.lg.key}/${g.teamId}:`, e.message);
 return { g, players: [], failed: true };
@@ -994,8 +1170,9 @@ cands.push({ lgKey: g.lg.key, eventId: g.evId, eventName: g.eventName, eventStat
 }
 }
 // Do not misreport a failed/partial data lookup as a misspelled player or no games.
-if (scheduleFailures || fetched.some(f => f.failed || !f.players.length)) {
-throw new Error('ESPN schedule or roster data is unavailable');
+cands.partial = scheduleFailures > 0 || fetched.some(f => f.failed || !f.players.length);
+if (!cands.length && cands.partial) {
+throw new Error('Sports schedule or roster data is unavailable');
 }
 return cands;
 }
@@ -1053,8 +1230,16 @@ groups.get(k).push(w);
 for (const watches of groups.values()) {
 const lg = espnLeague(watches[0].league_key);
 if (!lg) continue;
+if (!leaguesForSport(lg.sport).some(l => l.key === lg.key)) {
+for (const w of watches) {
+await dmUser(w.user_id, `Your watch for ${w.player_name} uses an unsupported league. Create a new watch with /watchprop. No final result was inferred.`);
+await dbQuery(`UPDATE bot_watches SET status='unavailable', updated_at=NOW() WHERE id=$1`, [w.id]);
+}
+continue;
+}
 let summary;
-try { summary = await espnSummary(lg, watches[0].event_id); } catch (e) { continue; }
+try { summary = await watchSummary(lg, watches[0].event_id); }
+catch (e) { console.error(`watchprop live stats ${lg.key}:`, e.message); continue; }
 const state = summaryState(summary);
 for (const w of watches) {
 try {
@@ -1075,7 +1260,12 @@ await dbQuery(`UPDATE bot_watches SET last_value=$1, last_notified_value=$1, upd
 await dbQuery(`UPDATE bot_watches SET last_value=$1, updated_at=NOW() WHERE id=$2`, [cur, w.id]);
 }
 if (state === 'post') {
-const finalVal = hit ? hit.value : w.last_value;
+if (!hit) {
+await dmUser(w.user_id, `The game ended, but final ${word} for ${w.player_name} could not be verified. No target result can be confirmed.`);
+await dbQuery(`UPDATE bot_watches SET status='unavailable', updated_at=NOW() WHERE id=$1`, [w.id]);
+continue;
+}
+const finalVal = hit.value;
 let msg;
 if (hasTarget) {
 const verdict = finalVal >= w.target_value ? 'cleared ✅' : 'came up short ❌';
@@ -1111,6 +1301,9 @@ return Boolean(interaction.guildId)
 // Ask only for the player here; the target comes AFTER choosing a stat.
 async function handleWatchSportButton(interaction) {
 const sport = interaction.customId.split(':')[2];
+if (!leaguesForSport(sport).length) {
+return interaction.reply({ content: 'Unknown sport. Please start again with /watchprop.', ephemeral: true });
+}
 const modal = new ModalBuilder().setCustomId(`wp:modal:${sport}`).setTitle('Who do you want to watch?');
 const nameInput = new TextInputBuilder()
 .setCustomId('player').setLabel('Player name (or close to it)')
@@ -1144,6 +1337,7 @@ components: [new ActionRowBuilder().addComponents(menu)]
 // modal submitted -> resolve the typed name against today's rosters, then pick player or prop
 async function handleWatchModalSubmit(interaction) {
 const sport = interaction.customId.split(':')[2];
+if (!leaguesForSport(sport).length) return interaction.reply({ content: 'Unknown sport. Please start again with /watchprop.', ephemeral: true });
 const query = (interaction.fields.getTextInputValue('player') || '').trim();
 await interaction.deferReply({ ephemeral: true });
 const target = null;
@@ -1154,6 +1348,7 @@ return interaction.editReply('No upcoming or live games were found for this spor
 }
 const matches = rankWatchCandidates(cands, query).slice(0, 25);
 if (!matches.length) {
+if (cands.partial) return interaction.editReply('Some schedules or rosters could not be loaded, and that player was not found in the available data. Try again shortly.');
 return interaction.editReply(`I couldn't find a player like **${query}** in today's ${sport} games. Double-check the spelling — or they may not be playing today.`);
 }
 prunePendingWatchFlows();
@@ -1176,7 +1371,7 @@ return opt;
 await interaction.editReply({ content: `Found a few players like **${query}** — which one?`, components: [new ActionRowBuilder().addComponents(menu)] });
 } catch (e) {
 console.error('watchprop modal error:', e);
-await interaction.editReply('ESPN’s schedule or player roster could not be loaded. This does not mean there are no games. Please try `/watchprop` again in a moment.');
+await interaction.editReply('The player search could not be completed. Please try `/watchprop` again; the owner can check “watchprop modal error” in Railway logs for the cause.');
 }
 }
 
@@ -1832,11 +2027,7 @@ const data = [
 ], defaultMemberPermissions: ADMIN_ONLY },
 { name: 'clearpromos', description: 'Admin: remove all promos', defaultMemberPermissions: ADMIN_ONLY },
 // ===== WORLD CUP 2026 — TEMPORARY commands (remove these 3 after the tournament) =====
-{ name: 'wcfixtures', description: 'World Cup: today\'s matches + kickoff times' },
-{ name: 'wcstandings', description: 'World Cup: group-stage tables' },
-{ name: 'wcrecap', description: 'World Cup: goals & cards for a team\'s latest match', options: [{ name: 'team', type: 3, description: 'Country — e.g. Brazil', required: true }] },
 { name: 'updates', description: 'Pick a game, get pinged when it scores (#tools = all sports)' },
-{ name: 'teamstats', description: 'World Cup: pick a team playing today — see player goals, assists & shots on target' },
 // ===== end World Cup temporary commands =====
 { name: 'parlay', description: 'Calculate parlay odds & payout (wins channel only)', options: [{ name: 'odds', type: 3, description: 'Odds per leg, e.g. +150 -110 +200', required: true }, { name: 'stake', type: 10, description: 'Amount you are betting (optional)', required: false }], defaultMemberPermissions: ADMIN_ONLY }
 ];
@@ -2664,7 +2855,7 @@ if (i > 0 && i % 5 === 0) { rows.push(row); row = new ActionRowBuilder(); }
 row.addComponents(new ButtonBuilder().setCustomId(`wp:sport:${s.sport}`).setLabel(s.label).setStyle(ButtonStyle.Primary));
 });
 rows.push(row);
-await interaction.editReply({ content: '🎯 **Set a player-prop watch**\nPick a sport, then type a player and choose a stat. Tracks today’s upcoming/live games (Eastern time), including games still live after midnight:', components: rows });
+await interaction.editReply({ content: '🎯 **Set a player-prop watch**\nMLB, NHL and WNBA use league feeds. NBA, NFL, men’s college basketball and soccer (EPL, UCL, MLS, World Cup) use ESPN.\nChoose a sport, enter a player, select a stat, then an optional target. Watches check for updates every 45 seconds; provider delays may apply. Games are selected by Eastern date. WNBA players appear once the game roster is published:', components: rows });
 } catch (e) {
 console.error('watchprop command error:', e);
 await interaction.editReply('Something went wrong loading today\'s games. Please try again in a moment.');
@@ -3018,7 +3209,7 @@ res.status(500).send(htmlPage('Error', `<h1 class="error">Something went wrong</
 }
 });
 
-const BUILD_MARKER = 'watchprop-mlb-nfl-2026-10-28';
+const BUILD_MARKER = 'watchprop-all-sports-header-fix-2026-10-28';
 app.get('/', (_req, res) => {
 let betSlips = 'unknown';
 try {
