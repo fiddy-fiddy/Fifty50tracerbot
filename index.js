@@ -1108,19 +1108,15 @@ return Boolean(interaction.guildId)
 && (interaction.channel?.name || '').toLowerCase().replace(/[^a-z]/g, '') === 'watchprop';
 }
 
-// sport button -> pop a modal asking for the player's name (+ optional target number)
+// Ask only for the player here; the target comes AFTER choosing a stat.
 async function handleWatchSportButton(interaction) {
 const sport = interaction.customId.split(':')[2];
 const modal = new ModalBuilder().setCustomId(`wp:modal:${sport}`).setTitle('Who do you want to watch?');
 const nameInput = new TextInputBuilder()
 .setCustomId('player').setLabel('Player name (or close to it)')
 .setPlaceholder('e.g. LeBron James').setStyle(TextInputStyle.Short).setRequired(true).setMaxLength(60);
-const targetInput = new TextInputBuilder()
-.setCustomId('target').setLabel('Target number (optional)')
-.setPlaceholder('e.g. 25 — leave blank to just track it').setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(4);
 modal.addComponents(
-new ActionRowBuilder().addComponents(nameInput),
-new ActionRowBuilder().addComponents(targetInput)
+new ActionRowBuilder().addComponents(nameInput)
 );
 await interaction.showModal(modal);
 }
@@ -1149,16 +1145,8 @@ components: [new ActionRowBuilder().addComponents(menu)]
 async function handleWatchModalSubmit(interaction) {
 const sport = interaction.customId.split(':')[2];
 const query = (interaction.fields.getTextInputValue('player') || '').trim();
-const rawTarget = (interaction.fields.getTextInputValue('target') || '').trim();
 await interaction.deferReply({ ephemeral: true });
-// blank target = just track every climb; a non-blank target must be a whole number >= 1
-let target = null;
-if (rawTarget) {
-if (!/^[0-9]+$/.test(rawTarget) || parseInt(rawTarget, 10) < 1) {
-return interaction.editReply(`"${rawTarget}" isn't a valid target. Enter a whole number like **25**, or leave it blank to just track every climb.`);
-}
-target = parseInt(rawTarget, 10);
-}
+const target = null;
 try {
 const cands = await watchCandidatesForSport(sport);
 if (!cands.length) {
@@ -1204,7 +1192,7 @@ await interaction.deferUpdate();
 return sendPropPicker(interaction, token, idx);
 }
 
-// prop chosen -> save the watch (works pre-game; the poller starts DMing once the game is live)
+// Prop chosen -> ask for a target with explicit units before saving.
 async function handleWatchPropSelect(interaction) {
 const token = interaction.customId.split(':')[2];
 const state = getWatchFlow(token, interaction.user.id);
@@ -1213,12 +1201,38 @@ return interaction.update({ content: '⌛ That setup expired — run `/watchprop
 }
 const statKey = interaction.values[0];
 const def = WATCH_STATS[statKey];
+if (!def || !(WATCH_PROPS[state.sport] || []).some(p => p.key === statKey)) {
+return interaction.reply({ content: 'Please choose a valid stat for this sport.', ephemeral: true });
+}
+state.at = Date.now();
+const modal = new ModalBuilder().setCustomId(`wp:target:${token}:${statKey}`)
+.setTitle(`Track ${def.word}`.slice(0, 45));
+const input = new TextInputBuilder().setCustomId('target')
+.setLabel(`Target ${def.word} (optional)`.slice(0, 45))
+.setPlaceholder(`Whole-number goal, or blank for every increase`.slice(0, 100))
+.setStyle(TextInputStyle.Short).setRequired(false).setMaxLength(4);
+modal.addComponents(new ActionRowBuilder().addComponents(input));
+await interaction.showModal(modal);
+}
+
+async function handleWatchTargetSubmit(interaction) {
+const [, , token, statKey] = interaction.customId.split(':');
+const state = getWatchFlow(token, interaction.user.id);
+if (!state) return interaction.reply({ content: 'That setup expired — run `/watchprop` again.', ephemeral: true });
+const def = WATCH_STATS[statKey];
+if (!def || !(WATCH_PROPS[state.sport] || []).some(p => p.key === statKey)) {
+return interaction.reply({ content: 'Invalid stat. Run `/watchprop` again.', ephemeral: true });
+}
+const raw = interaction.fields.getTextInputValue('target').trim();
+if (raw && (!/^[0-9]{1,4}$/.test(raw) || Number(raw) < 1)) {
+return interaction.reply({ content: `Enter a positive whole-number target for ${def.word}, or leave it blank for every increase. Select the stat again to retry.`, ephemeral: true });
+}
+const target = raw ? Number(raw) : null;
 const chosen = state.matches[state.chosenIdx != null ? state.chosenIdx : 0];
-await interaction.deferUpdate();
+await interaction.deferReply({ ephemeral: true });
 try {
 const lg = espnLeague(chosen.lgKey);
 const word = def ? def.word : statKey;
-const target = state.target;
 await dbQuery(
 `INSERT INTO bot_watches (user_id, league_key, event_id, event_name, player_name, stat_key, target_value, last_value, last_notified_value, status, athlete_id)
 VALUES ($1,$2,$3,$4,$5,$6,$7,0,0,'active',$8)
@@ -1230,7 +1244,7 @@ pendingWatchFlows.delete(token);
 const lgName = lg ? lg.name : '';
 const pre = chosen.eventState === 'pre';
 const targetLine = target != null
-? `I'll DM you the moment they hit **${target}+ ${word}**`
+? `I'll DM you when their **${word}** increases and highlight when they reach **${target}+ ${word}**`
 : `I'll DM you each time their **${word}** goes up`;
 const startLine = pre
 ? `The game hasn't started yet — I'll start tracking the second it kicks off.`
@@ -1944,6 +1958,7 @@ return interaction.reply({ content: 'Use `/watchprop` in the #watchprop channel 
 }
 if (interaction.isButton() && interaction.customId.startsWith('wp:sport:')) return handleWatchSportButton(interaction);
 if (interaction.isModalSubmit() && interaction.customId.startsWith('wp:modal:')) return handleWatchModalSubmit(interaction);
+if (interaction.isModalSubmit() && interaction.customId.startsWith('wp:target:')) return handleWatchTargetSubmit(interaction);
 if (interaction.isStringSelectMenu() && interaction.customId.startsWith('wp:player:')) return handleWatchPlayerSelect(interaction);
 if (interaction.isStringSelectMenu() && interaction.customId.startsWith('wp:prop:')) return handleWatchPropSelect(interaction);
 if (!interaction.isChatInputCommand()) return;
